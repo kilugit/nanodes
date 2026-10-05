@@ -55,7 +55,6 @@ python train.py --stage1-epochs 100 --stage2-epochs 30 --batch-size-stage1 32 --
 
 ```
 nanodes/
-├── NanoDes_Colab.ipynb         # Interactive Google Colab Notebook
 ├── models.py                   # RepAFDenoiseNet, RepConv2d, Haar DWT/IWT
 ├── inference.py                # Tiled & full inference (PyTorch & ONNX)
 ├── export.py                   # ONNX FP32/FP16 & INT8 QDQ exporter
