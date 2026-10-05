@@ -79,6 +79,12 @@ class ExportTaskWorker(QThread):
         except Exception as e:
             self.log_signal.emit(f"ERROR: {e}")
             self.finished_signal.emit(False, str(e))
+        finally:
+            import gc
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
 
 class ModelExportGUI(QMainWindow):

@@ -35,7 +35,7 @@ def load_checkpoint_model(model_path: Optional[str] = None) -> nn.Module:
                 break
 
     if target_path and os.path.exists(target_path):
-        ckpt = torch.load(target_path, map_location="cpu")
+        ckpt = torch.load(target_path, map_location="cpu", weights_only=False)
         state = ckpt.get("state_dict", ckpt)
 
         if isinstance(ckpt, dict) and ckpt.get("quantized_format") == "symmetric_int8_per_channel":
@@ -123,7 +123,8 @@ class _ImageCalibrationDataReader:
 
         for p in paths[:num_samples]:
             try:
-                img = Image.open(p).convert("RGB").resize((input_shape[3], input_shape[2]))
+                with Image.open(p) as raw_img:
+                    img = raw_img.convert("RGB").resize((input_shape[3], input_shape[2]))
                 arr = np.array(img, dtype=np.float32).transpose(2, 0, 1) / 255.0
                 self.data.append({"noisy_image": np.expand_dims(arr, axis=0)})
             except Exception:

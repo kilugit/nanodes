@@ -4,10 +4,15 @@ import torch.nn.functional as F
 _WINDOW_CACHE = {}
 
 
+def clear_metrics_cache():
+    """Clears cached Gaussian windows to free memory."""
+    _WINDOW_CACHE.clear()
+
+
 def _get_gaussian_window(
     window_size: int, sigma: float, channels: int, device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
-    key = (window_size, sigma, channels, device, dtype)
+    key = (window_size, sigma, channels, str(device), dtype)
     window = _WINDOW_CACHE.get(key)
     if window is None:
         coords = torch.arange(window_size, dtype=torch.float32) - (window_size - 1) / 2.0
@@ -21,7 +26,7 @@ def _get_gaussian_window(
 
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0) -> float:
     diff = img1 - img2
-    mse = torch.mean(diff * diff)
+    mse = torch.mean(diff.square())
     if mse == 0:
         return float("inf")
     return (10.0 * torch.log10((data_range**2) / mse)).item()

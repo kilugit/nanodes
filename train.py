@@ -42,7 +42,7 @@ def train_one_epoch(
     device: torch.device,
 ) -> float:
     model.train()
-    running_loss = torch.zeros((), device=device)
+    running_loss = 0.0
     for noisy, clean in loader:
         noisy = noisy.to(device, non_blocking=True)
         clean = clean.to(device, non_blocking=True)
@@ -53,12 +53,12 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.detach() * noisy.size(0)
+        running_loss += loss.item() * noisy.size(0)
 
-    return (running_loss / len(loader.dataset)).item()
+    return running_loss / max(1, len(loader.dataset))
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def evaluate(
     model: nn.Module, loader: DataLoader, device: torch.device
 ) -> Tuple[float, float]:
@@ -174,6 +174,10 @@ def run_pipeline(args):
             f"({'*BEST*' if is_best else ''}) [{elapsed:.1f}s]"
         )
 
+    del optimizer_s1, scheduler_s1, criterion_s1, train_loader_s1
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
     # Stage 2: Fine-Tuning with 512x512 Patches
     print(f"\nStage 2: {args.stage2_epochs} epochs | Batch Size: {args.batch_size_stage2}")
     train_dataset.set_patch_size(512)
@@ -227,7 +231,7 @@ def run_pipeline(args):
 
     best_ckpt = os.path.join(args.checkpoint_dir, "best_model.pth")
     if os.path.exists(best_ckpt):
-        ckpt = torch.load(best_ckpt, map_location=device)
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["state_dict"])
         print(f"Loaded best checkpoint (PSNR: {ckpt.get('best_psnr', 0.0):.2f} dB)")
 
@@ -241,6 +245,11 @@ def run_pipeline(args):
 
     int8_path = os.path.join(args.export_dir, "repaf_denoise_net_int8.pth")
     export_int8_quantization(model, save_path=int8_path, calibration_loader=val_loader)
+
+    from dataset import clear_image_cache
+    clear_image_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     print("Training and export complete.")
 
 

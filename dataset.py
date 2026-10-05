@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import glob
 import os
 import random
@@ -51,7 +52,13 @@ def paired_crop(
     return noisy_patch, clean_patch
 
 
-_IMAGE_CACHE: Dict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor]] = {}
+_IMAGE_CACHE: OrderedDict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+_MAX_CACHE_ITEMS: int = 256
+
+
+def clear_image_cache():
+    """Clears in-memory cached tensors to reclaim RAM."""
+    _IMAGE_CACHE.clear()
 
 
 class DenoisingDataset(Dataset):
@@ -134,15 +141,21 @@ class DenoisingDataset(Dataset):
             return noisy, clean
 
         noisy_path, clean_path = self.paired_files[idx]
-        if self.cache and (noisy_path, clean_path) in _IMAGE_CACHE:
-            noisy, clean = _IMAGE_CACHE[(noisy_path, clean_path)]
+        cache_key = (noisy_path, clean_path)
+        if self.cache and cache_key in _IMAGE_CACHE:
+            noisy, clean = _IMAGE_CACHE[cache_key]
+            _IMAGE_CACHE.move_to_end(cache_key)
         else:
-            noisy_arr = np.array(Image.open(noisy_path).convert("RGB"))
-            clean_arr = np.array(Image.open(clean_path).convert("RGB"))
+            with Image.open(noisy_path) as n_img:
+                noisy_arr = np.array(n_img.convert("RGB"))
+            with Image.open(clean_path) as c_img:
+                clean_arr = np.array(c_img.convert("RGB"))
             noisy = torch.from_numpy(noisy_arr).permute(2, 0, 1)
             clean = torch.from_numpy(clean_arr).permute(2, 0, 1)
             if self.cache:
-                _IMAGE_CACHE[(noisy_path, clean_path)] = (noisy, clean)
+                if len(_IMAGE_CACHE) >= _MAX_CACHE_ITEMS:
+                    _IMAGE_CACHE.popitem(last=False)
+                _IMAGE_CACHE[cache_key] = (noisy, clean)
 
         if self.patch_size:
             noisy, clean = paired_crop(noisy, clean, self.patch_size, is_train=self.is_train)

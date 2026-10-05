@@ -12,10 +12,15 @@ def haar_dwt(x: torch.Tensor) -> torch.Tensor:
     x2 = x[:, :, 0::2, 1::2]  # top-right
     x3 = x[:, :, 1::2, 1::2]  # bottom-right
 
-    ll = 0.5 * (x0 + x1 + x2 + x3)
-    lh = 0.5 * (x0 - x1 + x2 - x3)
-    hl = 0.5 * (x0 + x1 - x2 - x3)
-    hh = 0.5 * (x0 - x1 - x2 + x3)
+    a = x0 + x2
+    b = x1 + x3
+    c = x0 - x2
+    d = x1 - x3
+
+    ll = 0.5 * (a + b)
+    lh = 0.5 * (a - b)
+    hl = 0.5 * (c + d)
+    hh = 0.5 * (c - d)
     return torch.cat([ll, lh, hl, hh], dim=1)
 
 
@@ -29,13 +34,18 @@ def haar_iwt(x: torch.Tensor) -> torch.Tensor:
     hl = x[:, 2 * c : 3 * c, :, :]
     hh = x[:, 3 * c : 4 * c, :, :]
 
-    x0 = 0.5 * (ll + lh + hl + hh)
-    x1 = 0.5 * (ll - lh + hl - hh)
-    x2 = 0.5 * (ll + lh - hl - hh)
-    x3 = 0.5 * (ll - lh - hl + hh)
+    p = ll + hl
+    q = lh + hh
+    r = ll - hl
+    s = lh - hh
+
+    x0 = 0.5 * (p + q)
+    x1 = 0.5 * (p - q)
+    x2 = 0.5 * (r + s)
+    x3 = 0.5 * (r - s)
 
     b, _, h2, w2 = ll.shape
-    out = torch.zeros(b, c, h2 * 2, w2 * 2, dtype=x.dtype, device=x.device)
+    out = torch.empty(b, c, h2 * 2, w2 * 2, dtype=x.dtype, device=x.device)
     out[:, :, 0::2, 0::2] = x0
     out[:, :, 1::2, 0::2] = x1
     out[:, :, 0::2, 1::2] = x2
@@ -249,7 +259,8 @@ class RepAFB(nn.Module):
         f_hf = self.hf_ecb(f_hf)
 
         m_lf = self.proj_mod(f_lf)
-        f_hf_mod = f_hf * m_lf.repeat(1, 3, 1, 1)
+        b, _, h, w = f_hf.shape
+        f_hf_mod = (f_hf.reshape(b, 3, self.c_lf, h, w) * m_lf.unsqueeze(1)).flatten(1, 2)
 
         f_cat = torch.cat([f_lf, f_hf_mod], dim=1)
 

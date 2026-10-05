@@ -51,13 +51,17 @@ for directory in REQUIRED_DIRS:
 
 
 def pil_to_qpixmap(pil_img: Image.Image, max_size: Tuple[int, int] = (900, 650)) -> QPixmap:
-    preview = pil_img.copy()
-    preview.thumbnail(max_size, Image.Resampling.BILINEAR)
+    w, h = pil_img.size
+    if w > max_size[0] or h > max_size[1]:
+        scale = min(max_size[0] / w, max_size[1] / h)
+        preview = pil_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.BILINEAR)
+    else:
+        preview = pil_img
     if preview.mode != "RGB":
         preview = preview.convert("RGB")
     data = preview.tobytes("raw", "RGB")
     qimg = QImage(data, preview.width, preview.height, preview.width * 3, QImage.Format.Format_RGB888)
-    return QPixmap.fromImage(qimg.copy())
+    return QPixmap.fromImage(qimg)
 
 
 # -----------------------------------------------------------------------------
@@ -210,7 +214,7 @@ class TrainingWorker(QThread):
                 train_dataset.set_patch_size(patch_size)
 
                 model.train()
-                epoch_loss = torch.zeros((), device=device)
+                epoch_loss = 0.0
                 for noisy, clean in loader_s1:
                     if self._is_stopped:
                         break
@@ -219,7 +223,7 @@ class TrainingWorker(QThread):
                     loss = criterion_s1(model(noisy), clean)
                     loss.backward()
                     optimizer_s1.step()
-                    epoch_loss += loss.detach() * noisy.size(0)
+                    epoch_loss += loss.item() * noisy.size(0)
 
                 if self._is_stopped:
                     self.log_signal.emit("Training cancelled by user.")
@@ -227,11 +231,11 @@ class TrainingWorker(QThread):
                     return
 
                 scheduler_s1.step()
-                mean_loss = (epoch_loss / max(1, len(train_dataset))).item()
+                mean_loss = epoch_loss / max(1, len(train_dataset))
 
                 model.eval()
                 val_psnr, val_ssim, count = 0.0, 0.0, 0
-                with torch.no_grad():
+                with torch.inference_mode():
                     for noisy, clean in val_loader:
                         if self._is_stopped:
                             self.log_signal.emit("Training cancelled by user.")
@@ -259,6 +263,10 @@ class TrainingWorker(QThread):
                     f"Loss: {mean_loss:.4f} | Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
                 )
 
+            del optimizer_s1, scheduler_s1, criterion_s1, loader_s1
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
             # Stage 2
             s2_epochs = self.config["stage2_epochs"]
             self.log_signal.emit(f"\n--- Starting Stage 2 ({s2_epochs} epochs) ---")
@@ -280,7 +288,7 @@ class TrainingWorker(QThread):
                     return
 
                 model.train()
-                epoch_loss = torch.zeros((), device=device)
+                epoch_loss = 0.0
                 for noisy, clean in loader_s2:
                     if self._is_stopped:
                         break
@@ -289,7 +297,7 @@ class TrainingWorker(QThread):
                     loss = criterion_s2(model(noisy), clean)
                     loss.backward()
                     optimizer_s2.step()
-                    epoch_loss += loss.detach() * noisy.size(0)
+                    epoch_loss += loss.item() * noisy.size(0)
 
                 if self._is_stopped:
                     self.log_signal.emit("Training cancelled by user.")
@@ -297,11 +305,11 @@ class TrainingWorker(QThread):
                     return
 
                 scheduler_s2.step()
-                mean_loss = (epoch_loss / max(1, len(train_dataset))).item()
+                mean_loss = epoch_loss / max(1, len(train_dataset))
 
                 model.eval()
                 val_psnr, val_ssim, count = 0.0, 0.0, 0
-                with torch.no_grad():
+                with torch.inference_mode():
                     for noisy, clean in val_loader:
                         if self._is_stopped:
                             self.log_signal.emit("Training cancelled by user.")
@@ -334,6 +342,14 @@ class TrainingWorker(QThread):
         except Exception as e:
             self.log_signal.emit(f"Error: {e}")
             self.finished.emit(f"Error: {e}")
+        finally:
+            from dataset import clear_image_cache
+            clear_image_cache()
+            import gc
+            if "device" in locals() and device.type == "cuda":
+                import torch
+                torch.cuda.empty_cache()
+            gc.collect()
 
 
 # -----------------------------------------------------------------------------
@@ -698,7 +714,8 @@ class RepAFDenoiseGUI(QMainWindow):
 
     def _set_active_image(self, file_path: str):
         self.image_path = file_path
-        self.loaded_image = Image.open(file_path).convert("RGB")
+        with Image.open(file_path) as raw_img:
+            self.loaded_image = raw_img.convert("RGB")
         self.noisy_image = self.loaded_image.copy()
         self.denoised_image = None
 

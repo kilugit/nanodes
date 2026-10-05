@@ -11,7 +11,7 @@ class CharbonnierLoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: Optional[torch.Tensor] = None) -> torch.Tensor:
         diff = pred - target if target is not None else pred
-        return torch.mean(torch.sqrt(diff * diff + self.eps2))
+        return torch.mean(torch.sqrt(diff.square() + self.eps2))
 
 
 class SpatialGradientLoss(nn.Module):
@@ -55,5 +55,5 @@ class PSNRLoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = pred - target
-        mse = torch.mean(diff * diff)
+        mse = torch.mean(diff.square())
         return -10.0 * torch.log10(self.scale / (mse + self.eps))
