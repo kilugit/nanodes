@@ -111,7 +111,6 @@ python train.py --stage1-epochs 100 --stage2-epochs 30 --batch-size-stage1 32 --
 
 ```
 nanodes/
-├── NanoDes_Colab.ipynb         # Interactive Google Colab Notebook
 ├── requirements.txt            # Python dependencies specification
 ├── models.py                   # RepAFDenoiseNet, RepConv2d, Haar DWT/IWT
 ├── inference.py                # Tiled & full inference (PyTorch & ONNX)
