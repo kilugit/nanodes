@@ -47,6 +47,7 @@ pip install -r requirements.txt
 Install the optimized PyTorch and ONNX Runtime backend for your hardware:
 
 - **AMD GPU (Native ROCm on Windows):**
+  Note: (device-gfx1200)=RX 9060XT.
   ```bash
   python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,device-gfx1200]==10.0.0"
   python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device-gfx1200]==2.13.0+rocm10.0.0" "torchvision[device-gfx1200]==0.28.0+rocm10.0.0" "torchaudio==2.11.0.2+rocm10.0.0"
