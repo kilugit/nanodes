@@ -1,0 +1,152 @@
+import glob
+import os
+import random
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+
+
+def paired_augment(noisy: torch.Tensor, clean: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    if random.random() > 0.5:
+        noisy = torch.flip(noisy, dims=[-1])
+        clean = torch.flip(clean, dims=[-1])
+
+    if random.random() > 0.5:
+        noisy = torch.flip(noisy, dims=[-2])
+        clean = torch.flip(clean, dims=[-2])
+
+    k = random.randint(0, 3)
+    if k > 0:
+        noisy = torch.rot90(noisy, k, dims=[-2, -1])
+        clean = torch.rot90(clean, k, dims=[-2, -1])
+
+    return noisy, clean
+
+
+def paired_crop(
+    noisy: torch.Tensor, clean: torch.Tensor, patch_size: int, is_train: bool = True
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    _, h, w = noisy.shape
+    if h < patch_size or w < patch_size:
+        pad_h = max(0, patch_size - h)
+        pad_w = max(0, patch_size - w)
+        pad_mode = "reflect" if (pad_w < w and pad_h < h) else "replicate"
+        noisy = F.pad(noisy, (0, pad_w, 0, pad_h), mode=pad_mode)
+        clean = F.pad(clean, (0, pad_w, 0, pad_h), mode=pad_mode)
+        _, h, w = noisy.shape
+
+    if is_train:
+        top = random.randint(0, h - patch_size)
+        left = random.randint(0, w - patch_size)
+    else:
+        top = (h - patch_size) // 2
+        left = (w - patch_size) // 2
+
+    noisy_patch = noisy[:, top : top + patch_size, left : left + patch_size]
+    clean_patch = clean[:, top : top + patch_size, left : left + patch_size]
+    return noisy_patch, clean_patch
+
+
+_IMAGE_CACHE: Dict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+class DenoisingDataset(Dataset):
+    """Paired image dataset for denoising training and validation."""
+
+    def __init__(
+        self,
+        noisy_dir: Optional[str] = None,
+        clean_dir: Optional[str] = None,
+        patch_size: int = 128,
+        is_train: bool = True,
+        num_synthetic_samples: int = 128,
+        cache: bool = True,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.is_train = is_train
+        self.cache = cache
+
+        self.paired_files: List[Tuple[str, str]] = []
+        if noisy_dir is None and clean_dir is None:
+            split_subdir = "train" if self.is_train else "val"
+            split_clean = os.path.join("samples", "processed", split_subdir, "clean")
+            split_noisy = os.path.join("samples", "processed", split_subdir, "noisy")
+            if os.path.exists(split_clean) and os.path.exists(split_noisy):
+                clean_dir = split_clean
+                noisy_dir = split_noisy
+            else:
+                default_clean = "samples/processed/clean"
+                default_noisy = "samples/processed/noisy"
+                if os.path.exists(default_clean) and os.path.exists(default_noisy):
+                    clean_dir = default_clean
+                    noisy_dir = default_noisy
+        elif clean_dir == "samples/processed/clean" and (not os.path.exists(clean_dir) or not glob.glob(os.path.join(clean_dir, "*.png"))):
+            split_subdir = "train" if self.is_train else "val"
+            split_clean = os.path.join("samples", "processed", split_subdir, "clean")
+            split_noisy = os.path.join("samples", "processed", split_subdir, "noisy")
+            if os.path.exists(split_clean) and os.path.exists(split_noisy):
+                clean_dir = split_clean
+                noisy_dir = split_noisy
+
+        if noisy_dir and clean_dir and os.path.exists(noisy_dir) and os.path.exists(clean_dir):
+            extensions = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp")
+            clean_paths = []
+            for ext in extensions:
+                clean_paths.extend(glob.glob(os.path.join(clean_dir, ext)))
+            clean_paths.sort()
+
+            for cp in clean_paths:
+                base = os.path.basename(cp)
+                np_path = os.path.join(noisy_dir, base)
+                if not os.path.exists(np_path) and "_clean" in base:
+                    noisy_base = base.replace("_clean.", "_noisy.")
+                    np_path = os.path.join(noisy_dir, noisy_base)
+
+                if os.path.exists(np_path):
+                    self.paired_files.append((np_path, cp))
+
+        self.use_synthetic = len(self.paired_files) == 0
+        self.num_synthetic_samples = num_synthetic_samples
+
+    def set_patch_size(self, patch_size: int):
+        self.patch_size = patch_size
+
+    def __len__(self) -> int:
+        if self.use_synthetic:
+            return self.num_synthetic_samples
+        return len(self.paired_files)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.use_synthetic:
+            base_size = max(512, self.patch_size)
+            clean = torch.rand(3, base_size, base_size, dtype=torch.float32)
+            noise_std = random.uniform(0.02, 0.10)
+            noisy = torch.clamp(clean + torch.randn_like(clean) * noise_std, 0.0, 1.0)
+            if self.patch_size:
+                noisy, clean = paired_crop(noisy, clean, self.patch_size, is_train=self.is_train)
+            if self.is_train:
+                noisy, clean = paired_augment(noisy, clean)
+            return noisy, clean
+
+        noisy_path, clean_path = self.paired_files[idx]
+        if self.cache and (noisy_path, clean_path) in _IMAGE_CACHE:
+            noisy, clean = _IMAGE_CACHE[(noisy_path, clean_path)]
+        else:
+            noisy_arr = np.array(Image.open(noisy_path).convert("RGB"))
+            clean_arr = np.array(Image.open(clean_path).convert("RGB"))
+            noisy = torch.from_numpy(noisy_arr).permute(2, 0, 1)
+            clean = torch.from_numpy(clean_arr).permute(2, 0, 1)
+            if self.cache:
+                _IMAGE_CACHE[(noisy_path, clean_path)] = (noisy, clean)
+
+        if self.patch_size:
+            noisy, clean = paired_crop(noisy, clean, self.patch_size, is_train=self.is_train)
+        if self.is_train:
+            noisy, clean = paired_augment(noisy, clean)
+
+        return noisy.float().div_(255.0), clean.float().div_(255.0)
