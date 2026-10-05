@@ -10,22 +10,78 @@
 
 ---
 
-## 💻 Local Setup & Execution
+## 💻 Local Setup & Installation
 
-### 1. Requirements
+### 1. Prerequisites
+- **Python:** 3.12
+- **Git**
+
+---
+
+### 2. Environment Setup & Dependency Installation
+
+#### A. Clone & Create Virtual Environment
 ```bash
+# Clone repository
 git clone https://github.com/kilugit/nanodes.git
 cd nanodes
-python -m venv venv
-# On Windows:
-venv\Scripts\activate
-# On Linux/macOS:
-source venv/bin/activate
 
-pip install torch torchvision onnx onnxruntime pillow matplotlib PyQt6
+# Create virtual environment with Python 3.12:
+py -3.12 -m venv venv
+
+# Activate virtual environment:
+# On Windows (PowerShell / Command Prompt):
+.\venv\Scripts\activate
+# On Linux / macOS:
+source venv/bin/activate
 ```
 
-### 2. Launch Local Desktop GUI
+#### B. Install Core Dependencies
+Install packages from `requirements.txt` (note: this repository uses `onnxruntime-windowsml` instead of `onnxruntime-directml`):
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+#### C. Hardware Acceleration (PyTorch & ROCm / CUDA)
+Install the optimized PyTorch and ONNX Runtime backend for your hardware:
+
+- **AMD GPU (Native ROCm on Windows):**
+  ```bash
+  python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,device-gfx1200]==10.0.0"
+  python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device-gfx1200]==2.13.0+rocm10.0.0" "torchvision[device-gfx1200]==0.28.0+rocm10.0.0" "torchaudio==2.11.0.2+rocm10.0.0"
+  ```
+
+- **ONNX Runtime (Windows ML):**
+  This repository uses `onnxruntime-windowsml` (latest version, providing `DmlExecutionProvider` and `CPUExecutionProvider`):
+  ```bash
+  pip install onnxruntime-windowsml
+  ```
+
+- **NVIDIA GPU (CUDA):**
+  ```bash
+  # PyTorch with CUDA 12.1:
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+  # ONNX Runtime with CUDA / TensorRT:
+  pip install onnxruntime-gpu
+  ```
+
+- **CPU-Only / Headless Server (No Desktop GUI):**
+  ```bash
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+  pip install onnx onnxruntime pillow numpy matplotlib
+  ```
+
+#### D. Verify Installation
+Run this quick check to confirm your environment and acceleration status:
+```bash
+python -c "import torch, onnxruntime as ort; print(f'PyTorch: {torch.__version__} | CUDA Available: {torch.cuda.is_available()}'); print(f'ONNX Runtime: {ort.__version__} | Providers: {ort.get_available_providers()}')"
+```
+
+---
+
+### 3. Launch Local Desktop GUI
 ```bash
 # Main Denoise & Training GUI
 run.bat        # or: python gui.py
@@ -34,7 +90,7 @@ run.bat        # or: python gui.py
 run_export.bat # or: python export_gui.py
 ```
 
-### 3. Command Line Interface (CLI)
+### 4. Command Line Interface (CLI)
 ```bash
 # Verify structural re-parameterization equivalence
 python -c "from models import test_reparameterization_equivalence; test_reparameterization_equivalence('cpu')"
@@ -55,6 +111,8 @@ python train.py --stage1-epochs 100 --stage2-epochs 30 --batch-size-stage1 32 --
 
 ```
 nanodes/
+├── NanoDes_Colab.ipynb         # Interactive Google Colab Notebook
+├── requirements.txt            # Python dependencies specification
 ├── models.py                   # RepAFDenoiseNet, RepConv2d, Haar DWT/IWT
 ├── inference.py                # Tiled & full inference (PyTorch & ONNX)
 ├── export.py                   # ONNX FP32/FP16 & INT8 QDQ exporter

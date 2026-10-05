@@ -1,0 +1,13 @@
+# ONNX Graph Export & Inference Engine
+onnx>=1.14.0
+onnxruntime-windowsml
+
+# Image Processing & Numerics
+pillow>=9.0.0
+numpy>=1.22.0
+
+# Visualization & Evaluation (Notebooks / Colab)
+matplotlib>=3.5.0
+
+# Desktop GUI (Required for gui.py and export_gui.py)
+PyQt6>=6.4.0
