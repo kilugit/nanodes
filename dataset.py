@@ -84,8 +84,8 @@ class DenoisingDataset(Dataset):
         super().__init__()
         self.patch_size = patch_size
         self.is_train = is_train
-        self.cache = cache
         self.preload_to_ram = preload_to_ram
+        self.cache = cache and not preload_to_ram
         self.cached_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
         self.paired_files: List[Tuple[str, str]] = []

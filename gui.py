@@ -174,7 +174,7 @@ class TrainingWorker(QThread):
                 patch_size=128,
                 is_train=True,
                 num_synthetic_samples=self.config.get("synthetic_samples", 64),
-                cache=True,
+                cache=not preload_ram,
                 preload_to_ram=preload_ram,
             )
             val_dataset = DenoisingDataset(
@@ -183,7 +183,7 @@ class TrainingWorker(QThread):
                 patch_size=256,
                 is_train=False,
                 num_synthetic_samples=32,
-                cache=True,
+                cache=not preload_ram,
                 preload_to_ram=preload_ram,
             )
             val_loader = DataLoader(
@@ -664,6 +664,7 @@ class RepAFDenoiseGUI(QMainWindow):
 
         self.chk_preload_ram = QCheckBox("Preload Data to RAM")
         self.chk_preload_ram.setChecked(False)
+        self.chk_preload_ram.toggled.connect(lambda c: self.spin_max_cache.setEnabled(not c))
 
         grid.addWidget(QLabel("Max Cache Items:"), 3, 0)
         grid.addWidget(self.spin_max_cache, 3, 1)
