@@ -187,7 +187,7 @@ class TrainingWorker(QThread):
             )
             val_loader = DataLoader(
                 val_dataset,
-                batch_size=2,
+                batch_size=16,
                 shuffle=False,
                 pin_memory=(device.type == "cuda"),
             )
@@ -196,6 +196,10 @@ class TrainingWorker(QThread):
             save_dir = "pytorch models"
             os.makedirs(save_dir, exist_ok=True)
             bf16 = self.config.get("bf16", False)
+            fp16 = self.config.get("fp16", False)
+            amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32)
+            amp_enabled = (fp16 or bf16) and device.type == "cuda"
+            scaler = torch.amp.GradScaler("cuda", enabled=(fp16 and device.type == "cuda"))
 
             # Stage 1
             s1_epochs = self.config["stage1_epochs"]
@@ -211,6 +215,7 @@ class TrainingWorker(QThread):
                 num_workers=num_workers,
                 pin_memory=(device.type == "cuda"),
                 persistent_workers=(num_workers > 0),
+                drop_last=(len(train_dataset) >= self.config["batch_size_stage1"]),
             )
 
             for epoch in range(1, s1_epochs + 1):
@@ -230,18 +235,31 @@ class TrainingWorker(QThread):
                         break
                     noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                     optimizer_s1.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                         loss = criterion_s1(model(noisy), clean)
                     if not torch.isfinite(loss) or loss.abs().item() > 100.0:
                         continue
-                    loss.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    if torch.isfinite(grad_norm):
-                        optimizer_s1.step()
-                        epoch_loss += loss.item() * noisy.size(0)
-                        valid_count += noisy.size(0)
+                    if scaler.is_enabled():
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer_s1)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        if torch.isfinite(grad_norm):
+                            scaler.step(optimizer_s1)
+                            scaler.update()
+                            epoch_loss += loss.item() * noisy.size(0)
+                            valid_count += noisy.size(0)
+                        else:
+                            optimizer_s1.zero_grad(set_to_none=True)
+                            scaler.update()
                     else:
-                        optimizer_s1.zero_grad(set_to_none=True)
+                        loss.backward()
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        if torch.isfinite(grad_norm):
+                            optimizer_s1.step()
+                            epoch_loss += loss.item() * noisy.size(0)
+                            valid_count += noisy.size(0)
+                        else:
+                            optimizer_s1.zero_grad(set_to_none=True)
 
                 if self._is_stopped:
                     self.log_signal.emit("Training cancelled by user.")
@@ -264,7 +282,7 @@ class TrainingWorker(QThread):
                                 self.finished.emit("Cancelled")
                                 return
                             noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                                 pred = torch.clamp(model(noisy), 0.0, 1.0)
                             if not torch.isfinite(pred).all():
                                 continue
@@ -305,7 +323,7 @@ class TrainingWorker(QThread):
             # Stage 2
             s2_epochs = self.config["stage2_epochs"]
             self.log_signal.emit(f"\n--- Starting Stage 2 ({s2_epochs} epochs) ---")
-            train_dataset.set_patch_size(512)
+            train_dataset.set_patch_size(256)
             loader_s2 = DataLoader(
                 train_dataset,
                 batch_size=self.config["batch_size_stage2"],
@@ -313,6 +331,7 @@ class TrainingWorker(QThread):
                 num_workers=num_workers,
                 pin_memory=(device.type == "cuda"),
                 persistent_workers=(num_workers > 0),
+                drop_last=(len(train_dataset) >= self.config["batch_size_stage2"]),
             )
             optimizer_s2 = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
             scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
@@ -332,18 +351,31 @@ class TrainingWorker(QThread):
                         break
                     noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                     optimizer_s2.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                         loss = criterion_s2(model(noisy), clean)
                     if not torch.isfinite(loss) or loss.abs().item() > 100.0:
                         continue
-                    loss.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    if torch.isfinite(grad_norm):
-                        optimizer_s2.step()
-                        epoch_loss += loss.item() * noisy.size(0)
-                        valid_count += noisy.size(0)
+                    if scaler.is_enabled():
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer_s2)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        if torch.isfinite(grad_norm):
+                            scaler.step(optimizer_s2)
+                            scaler.update()
+                            epoch_loss += loss.item() * noisy.size(0)
+                            valid_count += noisy.size(0)
+                        else:
+                            optimizer_s2.zero_grad(set_to_none=True)
+                            scaler.update()
                     else:
-                        optimizer_s2.zero_grad(set_to_none=True)
+                        loss.backward()
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        if torch.isfinite(grad_norm):
+                            optimizer_s2.step()
+                            epoch_loss += loss.item() * noisy.size(0)
+                            valid_count += noisy.size(0)
+                        else:
+                            optimizer_s2.zero_grad(set_to_none=True)
 
                 if self._is_stopped:
                     self.log_signal.emit("Training cancelled by user.")
@@ -366,7 +398,7 @@ class TrainingWorker(QThread):
                                 self.finished.emit("Cancelled")
                                 return
                             noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                                 pred = torch.clamp(model(noisy), 0.0, 1.0)
                             if not torch.isfinite(pred).all():
                                 continue
@@ -390,7 +422,7 @@ class TrainingWorker(QThread):
 
                 self.epoch_progress.emit(s1_epochs + epoch, s1_epochs + s2_epochs)
                 self.log_signal.emit(
-                    f"S2 [Epoch {epoch:02d}/{s2_epochs:02d}] Patch: 512x512 | "
+                    f"S2 [Epoch {epoch:02d}/{s2_epochs:02d}] Patch: 256x256 | "
                     f"PSNR Loss: {mean_loss:.4f} | {val_str}"
                 )
 
@@ -598,7 +630,7 @@ class RepAFDenoiseGUI(QMainWindow):
 
         self.spin_s2_batch = QSpinBox()
         self.spin_s2_batch.setRange(1, 1000000)
-        self.spin_s2_batch.setValue(8)
+        self.spin_s2_batch.setValue(16)
 
         grid.addWidget(QLabel("Stage 1 Epochs:"), 0, 0)
         grid.addWidget(self.spin_s1_epochs, 0, 1)
@@ -623,9 +655,14 @@ class RepAFDenoiseGUI(QMainWindow):
         grid.addWidget(QLabel("Eval Interval:"), 2, 2)
         grid.addWidget(self.spin_eval_interval, 2, 3)
 
+        self.chk_fp16 = QCheckBox("FP16 Mixed Precision")
+        self.chk_fp16.setChecked(True)
         self.chk_bf16 = QCheckBox("BF16 Mixed Precision")
-        self.chk_bf16.setChecked(True)
-        grid.addWidget(self.chk_bf16, 3, 0, 1, 2)
+        self.chk_bf16.setChecked(False)
+        self.chk_fp16.toggled.connect(lambda c: self.chk_bf16.setChecked(False) if c else None)
+        self.chk_bf16.toggled.connect(lambda c: self.chk_fp16.setChecked(False) if c else None)
+        grid.addWidget(self.chk_fp16, 3, 0)
+        grid.addWidget(self.chk_bf16, 3, 1)
 
         self.chk_preload_ram = QCheckBox("Preload Data to RAM")
         self.chk_preload_ram.setChecked(False)
@@ -892,8 +929,11 @@ class RepAFDenoiseGUI(QMainWindow):
             "eval_interval": self.spin_eval_interval.value(),
             "preload_ram": self.chk_preload_ram.isChecked(),
             "bf16": self.chk_bf16.isChecked(),
-            "train_clean_dir": "samples/processed/clean",
-            "train_noisy_dir": "samples/processed/noisy",
+            "fp16": self.chk_fp16.isChecked(),
+            "train_clean_dir": "samples/processed/train/clean" if os.path.exists("samples/processed/train/clean") else "samples/processed/clean",
+            "train_noisy_dir": "samples/processed/train/noisy" if os.path.exists("samples/processed/train/noisy") else "samples/processed/noisy",
+            "val_clean_dir": "samples/processed/val/clean" if os.path.exists("samples/processed/val/clean") else "samples/processed/clean",
+            "val_noisy_dir": "samples/processed/val/noisy" if os.path.exists("samples/processed/val/noisy") else "samples/processed/noisy",
             "synthetic_samples": 64,
         }
 

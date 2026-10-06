@@ -1,7 +1,7 @@
 import argparse
 import os
 import time
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -46,11 +46,15 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     bf16: bool = False,
+    fp16: bool = False,
+    scaler: Optional[torch.amp.GradScaler] = None,
 ) -> float:
     model.train()
     running_loss = 0.0
     valid_count = 0
     is_xla = (device.type == "xla")
+    amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32)
+    amp_enabled = (fp16 or bf16) and device.type == "cuda"
 
     device_loader = loader
     if is_xla:
@@ -66,36 +70,55 @@ def train_one_epoch(
             clean = clean.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             pred = model(noisy)
             loss = criterion(pred, clean)
         if not torch.isfinite(loss) or loss.abs().item() > 100.0:
             continue
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        if torch.isfinite(grad_norm):
-            if is_xla:
-                import torch_xla.core.xla_model as xm
-                xm.optimizer_step(optimizer)
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if torch.isfinite(grad_norm):
+                scaler.step(optimizer)
+                scaler.update()
+                running_loss += loss.item() * noisy.size(0)
+                valid_count += noisy.size(0)
             else:
-                optimizer.step()
-            running_loss += loss.item() * noisy.size(0)
-            valid_count += noisy.size(0)
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
         else:
-            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if torch.isfinite(grad_norm):
+                if is_xla:
+                    import torch_xla.core.xla_model as xm
+                    xm.optimizer_step(optimizer)
+                else:
+                    optimizer.step()
+                running_loss += loss.item() * noisy.size(0)
+                valid_count += noisy.size(0)
+            else:
+                optimizer.zero_grad(set_to_none=True)
 
     return running_loss / valid_count if valid_count > 0 else float("nan")
 
 
 @torch.inference_mode()
 def evaluate(
-    model: nn.Module, loader: DataLoader, device: torch.device, bf16: bool = False
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    bf16: bool = False,
+    fp16: bool = False,
 ) -> Tuple[float, float]:
     model.eval()
     total_psnr = torch.zeros(1, device=device)
     total_ssim = torch.zeros(1, device=device)
     count = 0
     is_xla = (device.type == "xla")
+    amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32)
+    amp_enabled = (fp16 or bf16) and device.type == "cuda"
 
     eval_loader = loader
     if is_xla:
@@ -110,7 +133,7 @@ def evaluate(
             noisy = noisy.to(device, non_blocking=True)
             clean = clean.to(device, non_blocking=True)
 
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
             pred = torch.clamp(model(noisy), 0.0, 1.0)
         if not torch.isfinite(pred).all():
             continue
@@ -160,9 +183,10 @@ def run_pipeline(args):
     if device.type == "cuda" and getattr(torch.version, "hip", None) is None:
         torch.backends.cudnn.benchmark = True
     dev_name = "Cloud TPU v6e-1 (Trillium)" if device.type == "xla" else (torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU")
-    precision_tag = " [BF16]" if args.bf16 else ""
+    precision_tag = " [FP16]" if args.fp16 else (" [BF16]" if args.bf16 else "")
     print(f"RepAF-Denoise Net Training Pipeline on {device} ({dev_name}){precision_tag}")
 
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.fp16 and device.type == "cuda"))
     model = RepAFDenoiseNet(c=40).to(device)
 
     train_dataset = DenoisingDataset(
@@ -212,15 +236,15 @@ def run_pipeline(args):
 
     for epoch in range(1, args.stage1_epochs + 1):
         t0 = time.time()
-        patch_size = get_progressive_patch_size(epoch - 1, args.stage1_epochs, min_size=128, max_size=256)
+        patch_size = args.patch_size or get_progressive_patch_size(epoch - 1, args.stage1_epochs, min_size=128, max_size=256)
         train_dataset.set_patch_size(patch_size)
 
-        loss = train_one_epoch(model, train_loader_s1, criterion_s1, optimizer_s1, device, bf16=args.bf16)
+        loss = train_one_epoch(model, train_loader_s1, criterion_s1, optimizer_s1, device, bf16=args.bf16, fp16=args.fp16, scaler=scaler)
         scheduler_s1.step()
 
         should_eval = (epoch % args.eval_interval == 0) or (epoch == args.stage1_epochs)
         if should_eval:
-            val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16)
+            val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16)
             is_best = val_psnr > best_psnr
             if is_best:
                 best_psnr = val_psnr
@@ -262,9 +286,9 @@ def run_pipeline(args):
         model.load_state_dict(ckpt["state_dict"])
         best_psnr = ckpt.get("best_psnr", best_psnr)
 
-    # Stage 2: Fine-Tuning with 512x512 Patches
+    # Stage 2: Fine-Tuning with 256x256 Patches
     print(f"\nStage 2: {args.stage2_epochs} epochs | Batch Size: {args.batch_size_stage2}")
-    train_dataset.set_patch_size(512)
+    train_dataset.set_patch_size(256)
     train_loader_s2 = DataLoader(
         train_dataset,
         batch_size=args.batch_size_stage2,
@@ -281,12 +305,12 @@ def run_pipeline(args):
 
     for epoch in range(1, args.stage2_epochs + 1):
         t0 = time.time()
-        loss = train_one_epoch(model, train_loader_s2, criterion_s2, optimizer_s2, device, bf16=args.bf16)
+        loss = train_one_epoch(model, train_loader_s2, criterion_s2, optimizer_s2, device, bf16=args.bf16, fp16=args.fp16, scaler=scaler)
         scheduler_s2.step()
 
         should_eval = (epoch % args.eval_interval == 0) or (epoch == args.stage2_epochs)
         if should_eval:
-            val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16)
+            val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16)
             is_best = val_psnr > best_psnr
             if is_best:
                 best_psnr = val_psnr
@@ -311,7 +335,7 @@ def run_pipeline(args):
         elapsed = time.time() - t0
         lr_curr = optimizer_s2.param_groups[0]["lr"]
         print(
-            f"Stage 2 [Epoch {epoch:02d}/{args.stage2_epochs:02d}] Patch: 512x512 | "
+            f"Stage 2 [Epoch {epoch:02d}/{args.stage2_epochs:02d}] Patch: 256x256 | "
             f"LR: {lr_curr:.6f} | PSNR Loss: {loss:.4f} | {val_str} [{elapsed:.1f}s]"
         )
 
@@ -353,8 +377,8 @@ def main():
     parser.add_argument("--stage1-epochs", type=int, default=100, help="Epochs for Stage 1")
     parser.add_argument("--stage2-epochs", type=int, default=30, help="Epochs for Stage 2")
     parser.add_argument("--batch-size-stage1", type=int, default=32, help="Batch size for Stage 1")
-    parser.add_argument("--batch-size-stage2", type=int, default=8, help="Batch size for Stage 2")
-    parser.add_argument("--batch-size-val", type=int, default=4, help="Batch size for validation")
+    parser.add_argument("--batch-size-stage2", type=int, default=16, help="Batch size for Stage 2")
+    parser.add_argument("--batch-size-val", type=int, default=16, help="Batch size for validation")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader num_workers")
     parser.add_argument("--eval-interval", type=int, default=5, help="Epoch interval for validation")
     parser.add_argument("--preload-ram", action="store_true", help="Preload dataset into RAM")
@@ -362,6 +386,8 @@ def main():
     parser.add_argument("--export-dir", type=str, default="exports", help="Directory to export models")
     parser.add_argument("--synthetic-samples", type=int, default=128, help="Synthetic samples if no dataset provided")
     parser.add_argument("--bf16", action="store_true", help="Enable BF16 mixed precision training")
+    parser.add_argument("--fp16", action="store_true", help="Enable FP16 mixed precision training")
+    parser.add_argument("--patch-size", type=int, default=None, help="Fixed patch size for Stage 1 (disables progressive resizing if set)")
     parser.add_argument("--dry-run", action="store_true", help="Run 1-epoch dry run")
 
     args = parser.parse_args()

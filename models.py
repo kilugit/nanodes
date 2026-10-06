@@ -211,22 +211,8 @@ class DepthwiseECB(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.is_deployed:
             return self.conv_deploy(x)
-
-        out_normal = self.conv_normal(x)
-
-        y_exp = self.conv_expand(x)
-        y_pad = F.pad(y_exp, (self.pad, self.pad, self.pad, self.pad), "constant", 0)
-        b_pad = self.conv_expand.bias.view(1, -1, 1, 1)
-        y_pad[:, :, : self.pad, :] = b_pad
-        y_pad[:, :, -self.pad :, :] = b_pad
-        y_pad[:, :, :, : self.pad] = b_pad
-        y_pad[:, :, :, -self.pad :] = b_pad
-        out_seq = F.conv2d(y_pad, self.conv_squeeze.weight, self.conv_squeeze.bias, groups=self.channels)
-
-        out_dx = F.conv2d(x, self.scale_dx * self.mask_dx, self.bias_dx, padding=self.pad, groups=self.channels)
-        out_dy = F.conv2d(x, self.scale_dy * self.mask_dy, self.bias_dy, padding=self.pad, groups=self.channels)
-        out_lap = F.conv2d(x, self.scale_lap * self.mask_lap, self.bias_lap, padding=self.pad, groups=self.channels)
-        return out_normal + out_seq + out_dx + out_dy + out_lap
+        k_rep, b_rep = self.get_equivalent_kernel_bias()
+        return F.conv2d(x, k_rep, b_rep, padding=self.pad, groups=self.channels)
 
 
 class RepAFB(nn.Module):
