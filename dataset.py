@@ -56,6 +56,13 @@ _IMAGE_CACHE: OrderedDict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor]] = 
 _MAX_CACHE_ITEMS: int = 2048
 
 
+def set_max_cache_items(n: int):
+    global _MAX_CACHE_ITEMS
+    _MAX_CACHE_ITEMS = max(0, int(n))
+    while len(_IMAGE_CACHE) > _MAX_CACHE_ITEMS:
+        _IMAGE_CACHE.popitem(last=False)
+
+
 def clear_image_cache():
     """Clears in-memory cached tensors to reclaim RAM."""
     _IMAGE_CACHE.clear()
@@ -162,7 +169,7 @@ class DenoisingDataset(Dataset):
         else:
             noisy_path, clean_path = self.paired_files[idx]
             cache_key = (noisy_path, clean_path)
-            if self.cache and cache_key in _IMAGE_CACHE:
+            if self.cache and _MAX_CACHE_ITEMS > 0 and cache_key in _IMAGE_CACHE:
                 noisy, clean = _IMAGE_CACHE[cache_key]
                 _IMAGE_CACHE.move_to_end(cache_key)
             else:
@@ -173,8 +180,8 @@ class DenoisingDataset(Dataset):
                         clean_arr = np.array(c_img.convert("RGB"))
                     noisy = torch.from_numpy(noisy_arr).permute(2, 0, 1)
                     clean = torch.from_numpy(clean_arr).permute(2, 0, 1)
-                    if self.cache:
-                        if len(_IMAGE_CACHE) >= _MAX_CACHE_ITEMS:
+                    if self.cache and _MAX_CACHE_ITEMS > 0:
+                        while len(_IMAGE_CACHE) >= _MAX_CACHE_ITEMS:
                             _IMAGE_CACHE.popitem(last=False)
                         _IMAGE_CACHE[cache_key] = (noisy, clean)
                 except (OSError, FileNotFoundError):

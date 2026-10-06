@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from dataset import DenoisingDataset
+from dataset import DenoisingDataset, set_max_cache_items
 from inference import run_denoise
 from models import RepAFDenoiseNet
 from process_samples import (
@@ -166,6 +166,7 @@ class TrainingWorker(QThread):
             num_workers = self.config.get("num_workers", 0)
             eval_interval = self.config.get("eval_interval", 5)
             preload_ram = self.config.get("preload_ram", False)
+            set_max_cache_items(self.config.get("max_cache_items", 2048))
 
             train_dataset = DenoisingDataset(
                 noisy_dir=self.config.get("train_noisy_dir"),
@@ -655,18 +656,27 @@ class RepAFDenoiseGUI(QMainWindow):
         grid.addWidget(QLabel("Eval Interval:"), 2, 2)
         grid.addWidget(self.spin_eval_interval, 2, 3)
 
+        self.spin_max_cache = QSpinBox()
+        self.spin_max_cache.setRange(0, 100000)
+        self.spin_max_cache.setValue(2048)
+        self.spin_max_cache.setSingleStep(256)
+        self.spin_max_cache.valueChanged.connect(set_max_cache_items)
+
+        self.chk_preload_ram = QCheckBox("Preload Data to RAM")
+        self.chk_preload_ram.setChecked(False)
+
+        grid.addWidget(QLabel("Max Cache Items:"), 3, 0)
+        grid.addWidget(self.spin_max_cache, 3, 1)
+        grid.addWidget(self.chk_preload_ram, 3, 2, 1, 2)
+
         self.chk_fp16 = QCheckBox("FP16 Mixed Precision")
         self.chk_fp16.setChecked(True)
         self.chk_bf16 = QCheckBox("BF16 Mixed Precision")
         self.chk_bf16.setChecked(False)
         self.chk_fp16.toggled.connect(lambda c: self.chk_bf16.setChecked(False) if c else None)
         self.chk_bf16.toggled.connect(lambda c: self.chk_fp16.setChecked(False) if c else None)
-        grid.addWidget(self.chk_fp16, 3, 0)
-        grid.addWidget(self.chk_bf16, 3, 1)
-
-        self.chk_preload_ram = QCheckBox("Preload Data to RAM")
-        self.chk_preload_ram.setChecked(False)
-        grid.addWidget(self.chk_preload_ram, 3, 2, 1, 2)
+        grid.addWidget(self.chk_fp16, 4, 0)
+        grid.addWidget(self.chk_bf16, 4, 1)
 
         layout.addWidget(cfg_box)
 
@@ -928,6 +938,7 @@ class RepAFDenoiseGUI(QMainWindow):
             "num_workers": self.spin_workers.value(),
             "eval_interval": self.spin_eval_interval.value(),
             "preload_ram": self.chk_preload_ram.isChecked(),
+            "max_cache_items": self.spin_max_cache.value(),
             "bf16": self.chk_bf16.isChecked(),
             "fp16": self.chk_fp16.isChecked(),
             "train_clean_dir": "samples/processed/train/clean" if os.path.exists("samples/processed/train/clean") else "samples/processed/clean",
