@@ -53,7 +53,7 @@ def paired_crop(
 
 
 _IMAGE_CACHE: OrderedDict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
-_MAX_CACHE_ITEMS: int = 256
+_MAX_CACHE_ITEMS: int = 2048
 
 
 def clear_image_cache():
@@ -72,11 +72,14 @@ class DenoisingDataset(Dataset):
         is_train: bool = True,
         num_synthetic_samples: int = 128,
         cache: bool = True,
+        preload_to_ram: bool = False,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.is_train = is_train
         self.cache = cache
+        self.preload_to_ram = preload_to_ram
+        self.cached_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
         self.paired_files: List[Tuple[str, str]] = []
         if noisy_dir is None and clean_dir is None:
@@ -120,6 +123,20 @@ class DenoisingDataset(Dataset):
         self.use_synthetic = len(self.paired_files) == 0
         self.num_synthetic_samples = num_synthetic_samples
 
+        if self.preload_to_ram and not self.use_synthetic:
+            for np_path, cp in self.paired_files:
+                try:
+                    with Image.open(np_path) as n_img:
+                        n_arr = np.array(n_img.convert("RGB"))
+                    with Image.open(cp) as c_img:
+                        c_arr = np.array(c_img.convert("RGB"))
+                    self.cached_pairs.append((
+                        torch.from_numpy(n_arr).permute(2, 0, 1),
+                        torch.from_numpy(c_arr).permute(2, 0, 1),
+                    ))
+                except (OSError, FileNotFoundError):
+                    continue
+
     def set_patch_size(self, patch_size: int):
         self.patch_size = patch_size
 
@@ -140,22 +157,28 @@ class DenoisingDataset(Dataset):
                 noisy, clean = paired_augment(noisy, clean)
             return noisy, clean
 
-        noisy_path, clean_path = self.paired_files[idx]
-        cache_key = (noisy_path, clean_path)
-        if self.cache and cache_key in _IMAGE_CACHE:
-            noisy, clean = _IMAGE_CACHE[cache_key]
-            _IMAGE_CACHE.move_to_end(cache_key)
+        if self.preload_to_ram and self.cached_pairs:
+            noisy, clean = self.cached_pairs[idx % len(self.cached_pairs)]
         else:
-            with Image.open(noisy_path) as n_img:
-                noisy_arr = np.array(n_img.convert("RGB"))
-            with Image.open(clean_path) as c_img:
-                clean_arr = np.array(c_img.convert("RGB"))
-            noisy = torch.from_numpy(noisy_arr).permute(2, 0, 1)
-            clean = torch.from_numpy(clean_arr).permute(2, 0, 1)
-            if self.cache:
-                if len(_IMAGE_CACHE) >= _MAX_CACHE_ITEMS:
-                    _IMAGE_CACHE.popitem(last=False)
-                _IMAGE_CACHE[cache_key] = (noisy, clean)
+            noisy_path, clean_path = self.paired_files[idx]
+            cache_key = (noisy_path, clean_path)
+            if self.cache and cache_key in _IMAGE_CACHE:
+                noisy, clean = _IMAGE_CACHE[cache_key]
+                _IMAGE_CACHE.move_to_end(cache_key)
+            else:
+                try:
+                    with Image.open(noisy_path) as n_img:
+                        noisy_arr = np.array(n_img.convert("RGB"))
+                    with Image.open(clean_path) as c_img:
+                        clean_arr = np.array(c_img.convert("RGB"))
+                    noisy = torch.from_numpy(noisy_arr).permute(2, 0, 1)
+                    clean = torch.from_numpy(clean_arr).permute(2, 0, 1)
+                    if self.cache:
+                        if len(_IMAGE_CACHE) >= _MAX_CACHE_ITEMS:
+                            _IMAGE_CACHE.popitem(last=False)
+                        _IMAGE_CACHE[cache_key] = (noisy, clean)
+                except (OSError, FileNotFoundError):
+                    return self.__getitem__((idx + 1) % len(self.paired_files))
 
         if self.patch_size:
             noisy, clean = paired_crop(noisy, clean, self.patch_size, is_train=self.is_train)

@@ -24,14 +24,18 @@ def _get_gaussian_window(
     return window
 
 
-def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0) -> float:
+def calculate_psnr(
+    img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0, as_tensor: bool = False
+):
     diff = img1 - img2
     mse = torch.mean(diff.square())
     if not torch.isfinite(mse) or mse < 0:
-        return 0.0
-    if mse == 0:
-        return float("inf")
-    return (10.0 * torch.log10((data_range**2) / mse)).item()
+        val = torch.tensor(0.0, device=img1.device)
+    elif mse == 0:
+        val = torch.tensor(float("inf"), device=img1.device)
+    else:
+        val = 10.0 * torch.log10((data_range**2) / mse)
+    return val if as_tensor else val.item()
 
 
 def calculate_ssim(
@@ -40,7 +44,8 @@ def calculate_ssim(
     window_size: int = 11,
     sigma: float = 1.5,
     data_range: float = 1.0,
-) -> float:
+    as_tensor: bool = False,
+):
     channels = img1.size(1)
     window = _get_gaussian_window(window_size, sigma, channels, img1.device, img1.dtype)
 
@@ -61,5 +66,5 @@ def calculate_ssim(
     ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
         (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
     )
-    val = ssim_map.mean().item()
-    return val if val == val else 0.0
+    val = torch.nan_to_num(ssim_map.mean(), nan=0.0)
+    return val if as_tensor else val.item()

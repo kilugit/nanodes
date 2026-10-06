@@ -92,8 +92,8 @@ def evaluate(
     model: nn.Module, loader: DataLoader, device: torch.device, bf16: bool = False
 ) -> Tuple[float, float]:
     model.eval()
-    total_psnr = 0.0
-    total_ssim = 0.0
+    total_psnr = torch.zeros(1, device=device)
+    total_ssim = torch.zeros(1, device=device)
     count = 0
     is_xla = (device.type == "xla")
 
@@ -118,12 +118,13 @@ def evaluate(
             import torch_xla.core.xla_model as xm
             xm.mark_step()
 
-        total_psnr += calculate_psnr(pred, clean) * noisy.size(0)
-        total_ssim += calculate_ssim(pred, clean) * noisy.size(0)
-        count += noisy.size(0)
+        bs = noisy.size(0)
+        total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
+        total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
+        count += bs
 
-    mean_psnr = total_psnr / count if count > 0 else 0.0
-    mean_ssim = total_ssim / count if count > 0 else 0.0
+    mean_psnr = (total_psnr / count).item() if count > 0 else 0.0
+    mean_ssim = (total_ssim / count).item() if count > 0 else 0.0
     return mean_psnr, mean_ssim
 
 
@@ -171,6 +172,7 @@ def run_pipeline(args):
         is_train=True,
         num_synthetic_samples=args.synthetic_samples,
         cache=True,
+        preload_to_ram=args.preload_ram,
     )
     val_dataset = DenoisingDataset(
         noisy_dir=args.val_noisy_dir,
@@ -179,6 +181,7 @@ def run_pipeline(args):
         is_train=False,
         num_synthetic_samples=max(16, args.synthetic_samples // 4),
         cache=True,
+        preload_to_ram=args.preload_ram,
     )
 
     val_loader = DataLoader(
@@ -203,6 +206,7 @@ def run_pipeline(args):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
         drop_last=(len(train_dataset) >= args.batch_size_stage1),
     )
 
@@ -214,10 +218,16 @@ def run_pipeline(args):
         loss = train_one_epoch(model, train_loader_s1, criterion_s1, optimizer_s1, device, bf16=args.bf16)
         scheduler_s1.step()
 
-        val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16)
-        is_best = val_psnr > best_psnr
-        if is_best:
-            best_psnr = val_psnr
+        should_eval = (epoch % args.eval_interval == 0) or (epoch == args.stage1_epochs)
+        if should_eval:
+            val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16)
+            is_best = val_psnr > best_psnr
+            if is_best:
+                best_psnr = val_psnr
+            val_str = f"Val PSNR: {val_psnr:.2f} dB | Val SSIM: {val_ssim:.4f} {'*BEST*' if is_best else ''}"
+        else:
+            is_best = False
+            val_str = "Val: (skipped)"
 
         save_checkpoint(
             {
@@ -236,8 +246,7 @@ def run_pipeline(args):
         lr_curr = optimizer_s1.param_groups[0]["lr"]
         print(
             f"Stage 1 [Epoch {epoch:03d}/{args.stage1_epochs:03d}] Patch: {patch_size:03d}x{patch_size:03d} | "
-            f"LR: {lr_curr:.6f} | Loss: {loss:.4f} | Val PSNR: {val_psnr:.2f} dB | Val SSIM: {val_ssim:.4f} "
-            f"({'*BEST*' if is_best else ''}) [{elapsed:.1f}s]"
+            f"LR: {lr_curr:.6f} | Loss: {loss:.4f} | {val_str} [{elapsed:.1f}s]"
         )
 
     del optimizer_s1, scheduler_s1, criterion_s1, train_loader_s1
@@ -262,6 +271,7 @@ def run_pipeline(args):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
         drop_last=(len(train_dataset) >= args.batch_size_stage2),
     )
 
@@ -274,10 +284,16 @@ def run_pipeline(args):
         loss = train_one_epoch(model, train_loader_s2, criterion_s2, optimizer_s2, device, bf16=args.bf16)
         scheduler_s2.step()
 
-        val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16)
-        is_best = val_psnr > best_psnr
-        if is_best:
-            best_psnr = val_psnr
+        should_eval = (epoch % args.eval_interval == 0) or (epoch == args.stage2_epochs)
+        if should_eval:
+            val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16)
+            is_best = val_psnr > best_psnr
+            if is_best:
+                best_psnr = val_psnr
+            val_str = f"Val PSNR: {val_psnr:.2f} dB | Val SSIM: {val_ssim:.4f} {'*BEST*' if is_best else ''}"
+        else:
+            is_best = False
+            val_str = "Val: (skipped)"
 
         save_checkpoint(
             {
@@ -296,8 +312,7 @@ def run_pipeline(args):
         lr_curr = optimizer_s2.param_groups[0]["lr"]
         print(
             f"Stage 2 [Epoch {epoch:02d}/{args.stage2_epochs:02d}] Patch: 512x512 | "
-            f"LR: {lr_curr:.6f} | PSNR Loss: {loss:.4f} | Val PSNR: {val_psnr:.2f} dB | Val SSIM: {val_ssim:.4f} "
-            f"({'*BEST*' if is_best else ''}) [{elapsed:.1f}s]"
+            f"LR: {lr_curr:.6f} | PSNR Loss: {loss:.4f} | {val_str} [{elapsed:.1f}s]"
         )
 
     # Re-parameterization & Deployment Export
@@ -341,6 +356,8 @@ def main():
     parser.add_argument("--batch-size-stage2", type=int, default=8, help="Batch size for Stage 2")
     parser.add_argument("--batch-size-val", type=int, default=4, help="Batch size for validation")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader num_workers")
+    parser.add_argument("--eval-interval", type=int, default=5, help="Epoch interval for validation")
+    parser.add_argument("--preload-ram", action="store_true", help="Preload dataset into RAM")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--export-dir", type=str, default="exports", help="Directory to export models")
     parser.add_argument("--synthetic-samples", type=int, default=128, help="Synthetic samples if no dataset provided")

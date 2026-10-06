@@ -163,6 +163,10 @@ class TrainingWorker(QThread):
             self.log_signal.emit(f"Initializing RepAF-Denoise Net on {device}...")
             model = RepAFDenoiseNet(c=40).to(device)
 
+            num_workers = self.config.get("num_workers", 0)
+            eval_interval = self.config.get("eval_interval", 5)
+            preload_ram = self.config.get("preload_ram", False)
+
             train_dataset = DenoisingDataset(
                 noisy_dir=self.config.get("train_noisy_dir"),
                 clean_dir=self.config.get("train_clean_dir"),
@@ -170,6 +174,7 @@ class TrainingWorker(QThread):
                 is_train=True,
                 num_synthetic_samples=self.config.get("synthetic_samples", 64),
                 cache=True,
+                preload_to_ram=preload_ram,
             )
             val_dataset = DenoisingDataset(
                 noisy_dir=self.config.get("val_noisy_dir"),
@@ -178,6 +183,7 @@ class TrainingWorker(QThread):
                 is_train=False,
                 num_synthetic_samples=32,
                 cache=True,
+                preload_to_ram=preload_ram,
             )
             val_loader = DataLoader(
                 val_dataset,
@@ -202,7 +208,9 @@ class TrainingWorker(QThread):
                 train_dataset,
                 batch_size=self.config["batch_size_stage1"],
                 shuffle=True,
+                num_workers=num_workers,
                 pin_memory=(device.type == "cuda"),
+                persistent_workers=(num_workers > 0),
             )
 
             for epoch in range(1, s1_epochs + 1):
@@ -243,37 +251,45 @@ class TrainingWorker(QThread):
                 scheduler_s1.step()
                 mean_loss = epoch_loss / valid_count if valid_count > 0 else float("nan")
 
-                model.eval()
-                val_psnr, val_ssim, count = 0.0, 0.0, 0
-                with torch.inference_mode():
-                    for noisy, clean in val_loader:
-                        if self._is_stopped:
-                            self.log_signal.emit("Training cancelled by user.")
-                            self.finished.emit("Cancelled")
-                            return
-                        noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
-                            pred = torch.clamp(model(noisy), 0.0, 1.0)
-                        if not torch.isfinite(pred).all():
-                            continue
-                        val_psnr += calculate_psnr(pred, clean) * noisy.size(0)
-                        val_ssim += calculate_ssim(pred, clean) * noisy.size(0)
-                        count += noisy.size(0)
-                val_psnr = val_psnr / count if count > 0 else 0.0
-                val_ssim = val_ssim / count if count > 0 else 0.0
+                should_eval = (epoch % eval_interval == 0) or (epoch == s1_epochs)
+                if should_eval:
+                    model.eval()
+                    total_psnr = torch.zeros(1, device=device)
+                    total_ssim = torch.zeros(1, device=device)
+                    count = 0
+                    with torch.inference_mode():
+                        for noisy, clean in val_loader:
+                            if self._is_stopped:
+                                self.log_signal.emit("Training cancelled by user.")
+                                self.finished.emit("Cancelled")
+                                return
+                            noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                                pred = torch.clamp(model(noisy), 0.0, 1.0)
+                            if not torch.isfinite(pred).all():
+                                continue
+                            bs = noisy.size(0)
+                            total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
+                            total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
+                            count += bs
+                    val_psnr = (total_psnr / count).item() if count > 0 else 0.0
+                    val_ssim = (total_ssim / count).item() if count > 0 else 0.0
 
-                is_best = val_psnr > best_psnr
-                if is_best:
-                    best_psnr = val_psnr
-                    torch.save(
-                        {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 1},
-                        os.path.join(save_dir, "best_model.pth"),
-                    )
+                    is_best = val_psnr > best_psnr
+                    if is_best:
+                        best_psnr = val_psnr
+                        torch.save(
+                            {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 1},
+                            os.path.join(save_dir, "best_model.pth"),
+                        )
+                    val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
+                else:
+                    val_str = "Val: (skipped)"
 
                 self.epoch_progress.emit(epoch, s1_epochs + self.config["stage2_epochs"])
                 self.log_signal.emit(
                     f"S1 [Epoch {epoch:03d}/{s1_epochs:03d}] Patch: {patch_size}x{patch_size} | "
-                    f"Loss: {mean_loss:.4f} | Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
+                    f"Loss: {mean_loss:.4f} | {val_str}"
                 )
 
             del optimizer_s1, scheduler_s1, criterion_s1, loader_s1
@@ -294,7 +310,9 @@ class TrainingWorker(QThread):
                 train_dataset,
                 batch_size=self.config["batch_size_stage2"],
                 shuffle=True,
+                num_workers=num_workers,
                 pin_memory=(device.type == "cuda"),
+                persistent_workers=(num_workers > 0),
             )
             optimizer_s2 = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
             scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
@@ -335,37 +353,45 @@ class TrainingWorker(QThread):
                 scheduler_s2.step()
                 mean_loss = epoch_loss / valid_count if valid_count > 0 else float("nan")
 
-                model.eval()
-                val_psnr, val_ssim, count = 0.0, 0.0, 0
-                with torch.inference_mode():
-                    for noisy, clean in val_loader:
-                        if self._is_stopped:
-                            self.log_signal.emit("Training cancelled by user.")
-                            self.finished.emit("Cancelled")
-                            return
-                        noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
-                            pred = torch.clamp(model(noisy), 0.0, 1.0)
-                        if not torch.isfinite(pred).all():
-                            continue
-                        val_psnr += calculate_psnr(pred, clean) * noisy.size(0)
-                        val_ssim += calculate_ssim(pred, clean) * noisy.size(0)
-                        count += noisy.size(0)
-                val_psnr = val_psnr / count if count > 0 else 0.0
-                val_ssim = val_ssim / count if count > 0 else 0.0
+                should_eval = (epoch % eval_interval == 0) or (epoch == s2_epochs)
+                if should_eval:
+                    model.eval()
+                    total_psnr = torch.zeros(1, device=device)
+                    total_ssim = torch.zeros(1, device=device)
+                    count = 0
+                    with torch.inference_mode():
+                        for noisy, clean in val_loader:
+                            if self._is_stopped:
+                                self.log_signal.emit("Training cancelled by user.")
+                                self.finished.emit("Cancelled")
+                                return
+                            noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                                pred = torch.clamp(model(noisy), 0.0, 1.0)
+                            if not torch.isfinite(pred).all():
+                                continue
+                            bs = noisy.size(0)
+                            total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
+                            total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
+                            count += bs
+                    val_psnr = (total_psnr / count).item() if count > 0 else 0.0
+                    val_ssim = (total_ssim / count).item() if count > 0 else 0.0
 
-                is_best = val_psnr > best_psnr
-                if is_best:
-                    best_psnr = val_psnr
-                    torch.save(
-                        {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 2},
-                        os.path.join(save_dir, "best_model.pth"),
-                    )
+                    is_best = val_psnr > best_psnr
+                    if is_best:
+                        best_psnr = val_psnr
+                        torch.save(
+                            {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 2},
+                            os.path.join(save_dir, "best_model.pth"),
+                        )
+                    val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
+                else:
+                    val_str = "Val: (skipped)"
 
                 self.epoch_progress.emit(s1_epochs + epoch, s1_epochs + s2_epochs)
                 self.log_signal.emit(
                     f"S2 [Epoch {epoch:02d}/{s2_epochs:02d}] Patch: 512x512 | "
-                    f"PSNR Loss: {mean_loss:.4f} | Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
+                    f"PSNR Loss: {mean_loss:.4f} | {val_str}"
                 )
 
             self.log_signal.emit(f"\nTraining Complete! Best PSNR: {best_psnr:.2f} dB")
@@ -584,9 +610,26 @@ class RepAFDenoiseGUI(QMainWindow):
         grid.addWidget(QLabel("Stage 2 Batch Size:"), 1, 2)
         grid.addWidget(self.spin_s2_batch, 1, 3)
 
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(0, 16)
+        self.spin_workers.setValue(2)
+
+        self.spin_eval_interval = QSpinBox()
+        self.spin_eval_interval.setRange(1, 100)
+        self.spin_eval_interval.setValue(5)
+
+        grid.addWidget(QLabel("Workers:"), 2, 0)
+        grid.addWidget(self.spin_workers, 2, 1)
+        grid.addWidget(QLabel("Eval Interval:"), 2, 2)
+        grid.addWidget(self.spin_eval_interval, 2, 3)
+
         self.chk_bf16 = QCheckBox("BF16 Mixed Precision")
         self.chk_bf16.setChecked(True)
-        grid.addWidget(self.chk_bf16, 2, 0, 1, 2)
+        grid.addWidget(self.chk_bf16, 3, 0, 1, 2)
+
+        self.chk_preload_ram = QCheckBox("Preload Data to RAM")
+        self.chk_preload_ram.setChecked(False)
+        grid.addWidget(self.chk_preload_ram, 3, 2, 1, 2)
 
         layout.addWidget(cfg_box)
 
@@ -845,6 +888,9 @@ class RepAFDenoiseGUI(QMainWindow):
             "stage2_epochs": self.spin_s2_epochs.value(),
             "batch_size_stage1": self.spin_s1_batch.value(),
             "batch_size_stage2": self.spin_s2_batch.value(),
+            "num_workers": self.spin_workers.value(),
+            "eval_interval": self.spin_eval_interval.value(),
+            "preload_ram": self.chk_preload_ram.isChecked(),
             "bf16": self.chk_bf16.isChecked(),
             "train_clean_dir": "samples/processed/clean",
             "train_noisy_dir": "samples/processed/noisy",
