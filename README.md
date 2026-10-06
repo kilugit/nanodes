@@ -5,7 +5,7 @@
 [![ONNX](https://img.shields.io/badge/ONNX-Runtime-005CED.svg?logo=onnx&logoColor=white)](https://onnxruntime.ai/)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-> **NanoDes** is an ultra-fast, lightweight image denoising and artifact-removal model architecture designed for edge devices and real-time processing. Powered by **RepAF-Denoise Net** (Re-parameterized Asymmetric Feature Denoise Net) with 2D Haar Wavelet Transforms and Multi-Branch Structural Re-parameterization.
+> **NanoDes** is an lightweight image denoising and artifact-removal model. Powered by **RepAF-Denoise Net** (Re-parameterized Asymmetric Feature Denoise Net) with 2D Haar Wavelet Transforms and Multi-Branch Structural Re-parameterization.
 
 
 ---
