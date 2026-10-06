@@ -679,6 +679,9 @@ class RepAFDenoiseGUI(QMainWindow):
         grid.addWidget(self.chk_fp16, 4, 0)
         grid.addWidget(self.chk_bf16, 4, 1)
 
+        self.chk_shutdown = QCheckBox("Shutdown PC after training")
+        grid.addWidget(self.chk_shutdown, 4, 2, 1, 2)
+
         layout.addWidget(cfg_box)
 
         # Buttons & Progress
@@ -973,6 +976,13 @@ class RepAFDenoiseGUI(QMainWindow):
         self.btn_stop_train.setEnabled(False)
         self._refresh_models()
         self.status_label.setText(f"Training finished: {status}")
+
+        if self.chk_shutdown.isChecked() and status == "Success":
+            self.train_log.append("Shutting down computer in 60 seconds...")
+            if sys.platform == "win32":
+                os.system("shutdown /s /t 60")
+            else:
+                os.system("shutdown -h now")
 
     # -------------------------------------------------------------------------
     # Data Generation Actions
