@@ -40,18 +40,18 @@ def add_realistic_noise(
     arr = np.array(img, dtype=np.float32) / 255.0
 
     if noise_type == "gaussian":
-        noise = gen.normal(0.0, sigma, arr.shape)
+        noise = gen.standard_normal(arr.shape, dtype=np.float32) * sigma
     elif noise_type == "poisson":
-        shot_std = sigma * np.sqrt(np.maximum(arr, 1e-4))
-        noise = gen.normal(0.0, 1.0, arr.shape) * shot_std
+        shot_std = sigma * np.sqrt(np.maximum(arr, 1e-4, dtype=np.float32))
+        noise = gen.standard_normal(arr.shape, dtype=np.float32) * shot_std
     elif noise_type == "sensor":
-        shot_var = (sigma ** 2) * np.maximum(arr, 1e-4)
-        read_var = (sigma * 0.5) ** 2
+        shot_var = (sigma ** 2) * np.maximum(arr, 1e-4, dtype=np.float32)
+        read_var = np.float32((sigma * 0.5) ** 2)
         channel_gains = gen.uniform(0.85, 1.15, size=(1, 1, 3)).astype(np.float32)
         total_std = np.sqrt(shot_var + read_var) * channel_gains
-        noise = gen.normal(0.0, 1.0, arr.shape) * total_std
+        noise = gen.standard_normal(arr.shape, dtype=np.float32) * total_std
     else:
-        noise = gen.normal(0.0, sigma, arr.shape)
+        noise = gen.standard_normal(arr.shape, dtype=np.float32) * sigma
 
     noisy_arr = np.clip((arr + noise) * 255.0 + 0.5, 0, 255).astype(np.uint8)
     return Image.fromarray(noisy_arr)
@@ -169,7 +169,8 @@ def process_sample_image(
         return []
 
     try:
-        img = Image.open(image_path).convert("RGB")
+        with Image.open(image_path) as raw_img:
+            img = raw_img.convert("RGB")
     except Exception as e:
         print(f"Warning: Failed to open image {image_path}: {e}")
         return []
@@ -261,8 +262,8 @@ def process_sample_image(
             clean_out = os.path.join(output_clean_dir, clean_filename)
             noisy_out = os.path.join(output_noisy_dir, noisy_filename)
 
-            clean_patch.save(clean_out, format="PNG")
-            noisy_patch.save(noisy_out, format="PNG")
+            clean_patch.save(clean_out, format="PNG", compress_level=1)
+            noisy_patch.save(noisy_out, format="PNG", compress_level=1)
 
             if not (os.path.exists(clean_out) and os.path.getsize(clean_out) > 0):
                 raise IOError(f"Failed to write output to {clean_out}")

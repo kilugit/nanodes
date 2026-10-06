@@ -215,15 +215,23 @@ class TrainingWorker(QThread):
 
                 model.train()
                 epoch_loss = 0.0
+                valid_count = 0
                 for noisy, clean in loader_s1:
                     if self._is_stopped:
                         break
                     noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                     optimizer_s1.zero_grad(set_to_none=True)
                     loss = criterion_s1(model(noisy), clean)
+                    if not torch.isfinite(loss) or loss.abs().item() > 100.0:
+                        continue
                     loss.backward()
-                    optimizer_s1.step()
-                    epoch_loss += loss.item() * noisy.size(0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if torch.isfinite(grad_norm):
+                        optimizer_s1.step()
+                        epoch_loss += loss.item() * noisy.size(0)
+                        valid_count += noisy.size(0)
+                    else:
+                        optimizer_s1.zero_grad(set_to_none=True)
 
                 if self._is_stopped:
                     self.log_signal.emit("Training cancelled by user.")
@@ -231,7 +239,7 @@ class TrainingWorker(QThread):
                     return
 
                 scheduler_s1.step()
-                mean_loss = epoch_loss / max(1, len(train_dataset))
+                mean_loss = epoch_loss / valid_count if valid_count > 0 else float("nan")
 
                 model.eval()
                 val_psnr, val_ssim, count = 0.0, 0.0, 0
@@ -243,11 +251,13 @@ class TrainingWorker(QThread):
                             return
                         noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                         pred = torch.clamp(model(noisy), 0.0, 1.0)
+                        if not torch.isfinite(pred).all():
+                            continue
                         val_psnr += calculate_psnr(pred, clean) * noisy.size(0)
                         val_ssim += calculate_ssim(pred, clean) * noisy.size(0)
                         count += noisy.size(0)
-                val_psnr /= max(1, count)
-                val_ssim /= max(1, count)
+                val_psnr = val_psnr / count if count > 0 else 0.0
+                val_ssim = val_ssim / count if count > 0 else 0.0
 
                 is_best = val_psnr > best_psnr
                 if is_best:
@@ -267,6 +277,12 @@ class TrainingWorker(QThread):
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
+            best_ckpt = os.path.join(save_dir, "best_model.pth")
+            if os.path.exists(best_ckpt):
+                ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+                model.load_state_dict(ckpt["state_dict"])
+                best_psnr = ckpt.get("best_psnr", best_psnr)
+
             # Stage 2
             s2_epochs = self.config["stage2_epochs"]
             self.log_signal.emit(f"\n--- Starting Stage 2 ({s2_epochs} epochs) ---")
@@ -279,7 +295,7 @@ class TrainingWorker(QThread):
             )
             optimizer_s2 = AdamW(model.parameters(), lr=2e-3, betas=(0.9, 0.999), weight_decay=1e-4)
             scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
-            criterion_s2 = PSNRLoss().to(device)
+            criterion_s2 = PSNRLoss(eps=1e-6).to(device)
 
             for epoch in range(1, s2_epochs + 1):
                 if self._is_stopped:
@@ -289,15 +305,23 @@ class TrainingWorker(QThread):
 
                 model.train()
                 epoch_loss = 0.0
+                valid_count = 0
                 for noisy, clean in loader_s2:
                     if self._is_stopped:
                         break
                     noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                     optimizer_s2.zero_grad(set_to_none=True)
                     loss = criterion_s2(model(noisy), clean)
+                    if not torch.isfinite(loss) or loss.abs().item() > 100.0:
+                        continue
                     loss.backward()
-                    optimizer_s2.step()
-                    epoch_loss += loss.item() * noisy.size(0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if torch.isfinite(grad_norm):
+                        optimizer_s2.step()
+                        epoch_loss += loss.item() * noisy.size(0)
+                        valid_count += noisy.size(0)
+                    else:
+                        optimizer_s2.zero_grad(set_to_none=True)
 
                 if self._is_stopped:
                     self.log_signal.emit("Training cancelled by user.")
@@ -305,7 +329,7 @@ class TrainingWorker(QThread):
                     return
 
                 scheduler_s2.step()
-                mean_loss = epoch_loss / max(1, len(train_dataset))
+                mean_loss = epoch_loss / valid_count if valid_count > 0 else float("nan")
 
                 model.eval()
                 val_psnr, val_ssim, count = 0.0, 0.0, 0
@@ -317,11 +341,13 @@ class TrainingWorker(QThread):
                             return
                         noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                         pred = torch.clamp(model(noisy), 0.0, 1.0)
+                        if not torch.isfinite(pred).all():
+                            continue
                         val_psnr += calculate_psnr(pred, clean) * noisy.size(0)
                         val_ssim += calculate_ssim(pred, clean) * noisy.size(0)
                         count += noisy.size(0)
-                val_psnr /= max(1, count)
-                val_ssim /= max(1, count)
+                val_psnr = val_psnr / count if count > 0 else 0.0
+                val_ssim = val_ssim / count if count > 0 else 0.0
 
                 is_best = val_psnr > best_psnr
                 if is_best:

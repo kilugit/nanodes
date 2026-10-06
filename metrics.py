@@ -27,6 +27,8 @@ def _get_gaussian_window(
 def calculate_psnr(img1: torch.Tensor, img2: torch.Tensor, data_range: float = 1.0) -> float:
     diff = img1 - img2
     mse = torch.mean(diff.square())
+    if not torch.isfinite(mse) or mse < 0:
+        return 0.0
     if mse == 0:
         return float("inf")
     return (10.0 * torch.log10((data_range**2) / mse)).item()
@@ -59,4 +61,5 @@ def calculate_ssim(
     ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / (
         (mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2)
     )
-    return ssim_map.mean().item()
+    val = ssim_map.mean().item()
+    return val if val == val else 0.0

@@ -48,7 +48,7 @@ class Stage1Loss(nn.Module):
 
 
 class PSNRLoss(nn.Module):
-    def __init__(self, data_range: float = 1.0, eps: float = 1e-8):
+    def __init__(self, data_range: float = 1.0, eps: float = 1e-6):
         super().__init__()
         self.scale = data_range**2
         self.eps = eps

@@ -17,6 +17,11 @@ from models import RepAFDenoiseNet, test_reparameterization_equivalence
 
 
 def get_device() -> torch.device:
+    try:
+        import torch_xla.core.xla_model as xm
+        return xm.xla_device()
+    except Exception:
+        pass
     if torch.cuda.is_available():
         try:
             _ = torch.zeros(1, device="cuda")
@@ -43,19 +48,41 @@ def train_one_epoch(
 ) -> float:
     model.train()
     running_loss = 0.0
-    for noisy, clean in loader:
-        noisy = noisy.to(device, non_blocking=True)
-        clean = clean.to(device, non_blocking=True)
+    valid_count = 0
+    is_xla = (device.type == "xla")
+
+    device_loader = loader
+    if is_xla:
+        try:
+            import torch_xla.distributed.parallel_loader as pl
+            device_loader = pl.MpDeviceLoader(loader, device)
+        except Exception:
+            device_loader = loader
+
+    for noisy, clean in device_loader:
+        if not is_xla or noisy.device != device:
+            noisy = noisy.to(device, non_blocking=True)
+            clean = clean.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         pred = model(noisy)
         loss = criterion(pred, clean)
+        if not torch.isfinite(loss) or loss.abs().item() > 100.0:
+            continue
         loss.backward()
-        optimizer.step()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if torch.isfinite(grad_norm):
+            if is_xla:
+                import torch_xla.core.xla_model as xm
+                xm.optimizer_step(optimizer)
+            else:
+                optimizer.step()
+            running_loss += loss.item() * noisy.size(0)
+            valid_count += noisy.size(0)
+        else:
+            optimizer.zero_grad(set_to_none=True)
 
-        running_loss += loss.item() * noisy.size(0)
-
-    return running_loss / max(1, len(loader.dataset))
+    return running_loss / valid_count if valid_count > 0 else float("nan")
 
 
 @torch.inference_mode()
@@ -66,18 +93,34 @@ def evaluate(
     total_psnr = 0.0
     total_ssim = 0.0
     count = 0
+    is_xla = (device.type == "xla")
 
-    for noisy, clean in loader:
-        noisy = noisy.to(device, non_blocking=True)
-        clean = clean.to(device, non_blocking=True)
+    eval_loader = loader
+    if is_xla:
+        try:
+            import torch_xla.distributed.parallel_loader as pl
+            eval_loader = pl.MpDeviceLoader(loader, device)
+        except Exception:
+            eval_loader = loader
+
+    for noisy, clean in eval_loader:
+        if not is_xla or noisy.device != device:
+            noisy = noisy.to(device, non_blocking=True)
+            clean = clean.to(device, non_blocking=True)
 
         pred = torch.clamp(model(noisy), 0.0, 1.0)
+        if not torch.isfinite(pred).all():
+            continue
+        if is_xla:
+            import torch_xla.core.xla_model as xm
+            xm.mark_step()
+
         total_psnr += calculate_psnr(pred, clean) * noisy.size(0)
         total_ssim += calculate_ssim(pred, clean) * noisy.size(0)
         count += noisy.size(0)
 
-    mean_psnr = total_psnr / max(1, count)
-    mean_ssim = total_ssim / max(1, count)
+    mean_psnr = total_psnr / count if count > 0 else 0.0
+    mean_ssim = total_ssim / count if count > 0 else 0.0
     return mean_psnr, mean_ssim
 
 
@@ -86,16 +129,34 @@ def save_checkpoint(
 ):
     os.makedirs(save_dir, exist_ok=True)
     filepath = os.path.join(save_dir, filename)
-    torch.save(state, filepath)
-    if is_best:
-        torch.save(state, os.path.join(save_dir, "best_model.pth"))
+
+    # Detach and convert tensors to CPU for universal cross-platform checkpoint compatibility
+    cpu_state = {}
+    for k, v in state.items():
+        if k == "state_dict" and isinstance(v, dict):
+            cpu_state[k] = {pk: pv.cpu() if torch.is_tensor(pv) else pv for pk, pv in v.items()}
+        elif torch.is_tensor(v):
+            cpu_state[k] = v.cpu()
+        else:
+            cpu_state[k] = v
+
+    try:
+        import torch_xla.core.xla_model as xm
+        xm.save(cpu_state, filepath)
+        if is_best:
+            xm.save(cpu_state, os.path.join(save_dir, "best_model.pth"))
+    except Exception:
+        torch.save(cpu_state, filepath)
+        if is_best:
+            torch.save(cpu_state, os.path.join(save_dir, "best_model.pth"))
 
 
 def run_pipeline(args):
     device = get_device()
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    print(f"RepAF-Denoise Net Training Pipeline on {device} ({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'CPU'})")
+    dev_name = "Cloud TPU v6e-1 (Trillium)" if device.type == "xla" else (torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU")
+    print(f"RepAF-Denoise Net Training Pipeline on {device} ({dev_name})")
 
     model = RepAFDenoiseNet(c=40).to(device)
 
@@ -138,6 +199,7 @@ def run_pipeline(args):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        drop_last=(len(train_dataset) >= args.batch_size_stage1),
     )
 
     for epoch in range(1, args.stage1_epochs + 1):
@@ -177,6 +239,15 @@ def run_pipeline(args):
     del optimizer_s1, scheduler_s1, criterion_s1, train_loader_s1
     if device.type == "cuda":
         torch.cuda.empty_cache()
+    elif device.type == "xla":
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+
+    best_ckpt = os.path.join(args.checkpoint_dir, "best_model.pth")
+    if os.path.exists(best_ckpt):
+        ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["state_dict"])
+        best_psnr = ckpt.get("best_psnr", best_psnr)
 
     # Stage 2: Fine-Tuning with 512x512 Patches
     print(f"\nStage 2: {args.stage2_epochs} epochs | Batch Size: {args.batch_size_stage2}")
@@ -187,11 +258,12 @@ def run_pipeline(args):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        drop_last=(len(train_dataset) >= args.batch_size_stage2),
     )
 
     optimizer_s2 = AdamW(model.parameters(), lr=2e-3, betas=(0.9, 0.999), weight_decay=1e-4)
     scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=args.stage2_epochs, eta_min=1e-6)
-    criterion_s2 = PSNRLoss(data_range=1.0, eps=1e-8).to(device)
+    criterion_s2 = PSNRLoss(data_range=1.0, eps=1e-6).to(device)
 
     for epoch in range(1, args.stage2_epochs + 1):
         t0 = time.time()

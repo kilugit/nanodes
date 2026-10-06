@@ -273,7 +273,7 @@ class RepAFB(nn.Module):
         x_sca = x_gate * attn
 
         out = self.proj_out(x_sca)
-        return shortcut + out
+        return torch.clamp(shortcut + out, -10.0, 10.0)
 
 
 class RepAFDenoiseNet(nn.Module):

@@ -65,8 +65,12 @@ def get_hann_window_torch(
     key = (tile_size, width, str(device), dtype, h_tiled, w_tiled)
     mask = _HANN_WINDOW_CACHE.get(key)
     if mask is None:
-        w_y = torch.hann_window(tile_size, device=device, dtype=dtype).view(tile_size, 1) if h_tiled else torch.ones(tile_size, 1, device=device, dtype=dtype)
-        w_x = torch.hann_window(width, device=device, dtype=dtype).view(1, width) if w_tiled else torch.ones(1, width, device=device, dtype=dtype)
+        if getattr(device, "type", None) == "xla":
+            w_y = torch.hann_window(tile_size, dtype=dtype).to(device).view(tile_size, 1) if h_tiled else torch.ones(tile_size, 1, device=device, dtype=dtype)
+            w_x = torch.hann_window(width, dtype=dtype).to(device).view(1, width) if w_tiled else torch.ones(1, width, device=device, dtype=dtype)
+        else:
+            w_y = torch.hann_window(tile_size, device=device, dtype=dtype).view(tile_size, 1) if h_tiled else torch.ones(tile_size, 1, device=device, dtype=dtype)
+            w_x = torch.hann_window(width, device=device, dtype=dtype).view(1, width) if w_tiled else torch.ones(1, width, device=device, dtype=dtype)
         mask = torch.clamp((w_y * w_x).view(1, 1, tile_size, width), min=1e-4)
         _HANN_WINDOW_CACHE[key] = mask
     return mask
@@ -227,10 +231,24 @@ def run_denoise(
         denoised_img = Image.fromarray(out_arr)
 
     else:
-        dev = torch.device("cpu") if device == "cpu" else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if isinstance(device, torch.device):
+            dev = device
+        elif device == "cpu":
+            dev = torch.device("cpu")
+        elif "xla" in str(device):
+            try:
+                import torch_xla.core.xla_model as xm
+                dev = xm.xla_device()
+            except Exception:
+                dev = torch.device("cpu")
+        elif device == "cuda" or (device != "cpu" and torch.cuda.is_available()):
+            dev = torch.device("cuda")
+        else:
+            dev = torch.device("cpu")
+
         model = load_pytorch_model(model_path, dev)
 
-        # Transfer uint8 to GPU, then float/div on device for reduced PCIe bandwidth
+        # Transfer uint8 to GPU/TPU, then float/div on device for reduced host bandwidth
         arr = np.array(pil_img)
         x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(dev)
         x = x.float().div_(255.0)
@@ -252,6 +270,12 @@ def run_denoise(
         del x, out
         if dev.type == "cuda":
             torch.cuda.empty_cache()
+        elif dev.type == "xla":
+            try:
+                import torch_xla.core.xla_model as xm
+                xm.mark_step()
+            except Exception:
+                pass
 
     elapsed_ms = (time.time() - t0) * 1000.0
     return denoised_img, elapsed_ms
