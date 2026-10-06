@@ -194,7 +194,7 @@ class TrainingWorker(QThread):
             # Stage 1
             s1_epochs = self.config["stage1_epochs"]
             self.log_signal.emit(f"\n--- Starting Stage 1 ({s1_epochs} epochs) ---")
-            optimizer_s1 = AdamW(model.parameters(), lr=2e-3, betas=(0.9, 0.999), weight_decay=1e-4)
+            optimizer_s1 = AdamW(model.parameters(), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
             scheduler_s1 = CosineAnnealingLR(optimizer_s1, T_max=s1_epochs, eta_min=1e-6)
             criterion_s1 = Stage1Loss(eps=1e-3, lambda_grad=0.05).to(device)
 
@@ -296,7 +296,7 @@ class TrainingWorker(QThread):
                 shuffle=True,
                 pin_memory=(device.type == "cuda"),
             )
-            optimizer_s2 = AdamW(model.parameters(), lr=2e-3, betas=(0.9, 0.999), weight_decay=1e-4)
+            optimizer_s2 = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
             scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
             criterion_s2 = PSNRLoss(eps=1e-6).to(device)
 

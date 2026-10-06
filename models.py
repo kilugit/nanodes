@@ -258,7 +258,7 @@ class RepAFB(nn.Module):
         f_lf = self.lf_ecb(f_lf)
         f_hf = self.hf_ecb(f_hf)
 
-        m_lf = self.proj_mod(f_lf)
+        m_lf = torch.tanh(self.proj_mod(f_lf))
         b, _, h, w = f_hf.shape
         f_hf_mod = (f_hf.reshape(b, 3, self.c_lf, h, w) * m_lf.unsqueeze(1)).flatten(1, 2)
 
@@ -269,11 +269,11 @@ class RepAFB(nn.Module):
         x_gate = x1 * x2
 
         attn = x_gate.mean(dim=(2, 3), keepdim=True)
-        attn = self.sca_conv(attn)
+        attn = torch.sigmoid(self.sca_conv(attn))
         x_sca = x_gate * attn
 
         out = self.proj_out(x_sca)
-        return torch.clamp(shortcut + out, -10.0, 10.0)
+        return shortcut + out
 
 
 class RepAFDenoiseNet(nn.Module):

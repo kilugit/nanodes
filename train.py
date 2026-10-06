@@ -193,7 +193,7 @@ def run_pipeline(args):
 
     # Stage 1: Coarse Training with Progressive Patch Sizes
     print(f"\nStage 1: {args.stage1_epochs} epochs | Batch Size: {args.batch_size_stage1}")
-    optimizer_s1 = AdamW(model.parameters(), lr=2e-3, betas=(0.9, 0.999), weight_decay=1e-4)
+    optimizer_s1 = AdamW(model.parameters(), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
     scheduler_s1 = CosineAnnealingLR(optimizer_s1, T_max=args.stage1_epochs, eta_min=1e-6)
     criterion_s1 = Stage1Loss(eps=1e-3, lambda_grad=0.05).to(device)
 
@@ -265,7 +265,7 @@ def run_pipeline(args):
         drop_last=(len(train_dataset) >= args.batch_size_stage2),
     )
 
-    optimizer_s2 = AdamW(model.parameters(), lr=2e-3, betas=(0.9, 0.999), weight_decay=1e-4)
+    optimizer_s2 = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
     scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=args.stage2_epochs, eta_min=1e-6)
     criterion_s2 = PSNRLoss(data_range=1.0, eps=1e-6).to(device)
 
