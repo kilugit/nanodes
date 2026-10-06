@@ -189,6 +189,7 @@ class TrainingWorker(QThread):
             best_psnr = -float("inf")
             save_dir = "pytorch models"
             os.makedirs(save_dir, exist_ok=True)
+            bf16 = self.config.get("bf16", False)
 
             # Stage 1
             s1_epochs = self.config["stage1_epochs"]
@@ -221,7 +222,8 @@ class TrainingWorker(QThread):
                         break
                     noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                     optimizer_s1.zero_grad(set_to_none=True)
-                    loss = criterion_s1(model(noisy), clean)
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                        loss = criterion_s1(model(noisy), clean)
                     if not torch.isfinite(loss) or loss.abs().item() > 100.0:
                         continue
                     loss.backward()
@@ -250,7 +252,8 @@ class TrainingWorker(QThread):
                             self.finished.emit("Cancelled")
                             return
                         noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                        pred = torch.clamp(model(noisy), 0.0, 1.0)
+                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                            pred = torch.clamp(model(noisy), 0.0, 1.0)
                         if not torch.isfinite(pred).all():
                             continue
                         val_psnr += calculate_psnr(pred, clean) * noisy.size(0)
@@ -311,7 +314,8 @@ class TrainingWorker(QThread):
                         break
                     noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                     optimizer_s2.zero_grad(set_to_none=True)
-                    loss = criterion_s2(model(noisy), clean)
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                        loss = criterion_s2(model(noisy), clean)
                     if not torch.isfinite(loss) or loss.abs().item() > 100.0:
                         continue
                     loss.backward()
@@ -340,7 +344,8 @@ class TrainingWorker(QThread):
                             self.finished.emit("Cancelled")
                             return
                         noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                        pred = torch.clamp(model(noisy), 0.0, 1.0)
+                        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+                            pred = torch.clamp(model(noisy), 0.0, 1.0)
                         if not torch.isfinite(pred).all():
                             continue
                         val_psnr += calculate_psnr(pred, clean) * noisy.size(0)
@@ -578,6 +583,10 @@ class RepAFDenoiseGUI(QMainWindow):
         grid.addWidget(self.spin_s2_epochs, 1, 1)
         grid.addWidget(QLabel("Stage 2 Batch Size:"), 1, 2)
         grid.addWidget(self.spin_s2_batch, 1, 3)
+
+        self.chk_bf16 = QCheckBox("BF16 Mixed Precision")
+        self.chk_bf16.setChecked(True)
+        grid.addWidget(self.chk_bf16, 2, 0, 1, 2)
 
         layout.addWidget(cfg_box)
 
@@ -836,6 +845,7 @@ class RepAFDenoiseGUI(QMainWindow):
             "stage2_epochs": self.spin_s2_epochs.value(),
             "batch_size_stage1": self.spin_s1_batch.value(),
             "batch_size_stage2": self.spin_s2_batch.value(),
+            "bf16": self.chk_bf16.isChecked(),
             "train_clean_dir": "samples/processed/clean",
             "train_noisy_dir": "samples/processed/noisy",
             "synthetic_samples": 64,

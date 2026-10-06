@@ -45,6 +45,7 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    bf16: bool = False,
 ) -> float:
     model.train()
     running_loss = 0.0
@@ -65,8 +66,9 @@ def train_one_epoch(
             clean = clean.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        pred = model(noisy)
-        loss = criterion(pred, clean)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+            pred = model(noisy)
+            loss = criterion(pred, clean)
         if not torch.isfinite(loss) or loss.abs().item() > 100.0:
             continue
         loss.backward()
@@ -87,7 +89,7 @@ def train_one_epoch(
 
 @torch.inference_mode()
 def evaluate(
-    model: nn.Module, loader: DataLoader, device: torch.device
+    model: nn.Module, loader: DataLoader, device: torch.device, bf16: bool = False
 ) -> Tuple[float, float]:
     model.eval()
     total_psnr = 0.0
@@ -108,7 +110,8 @@ def evaluate(
             noisy = noisy.to(device, non_blocking=True)
             clean = clean.to(device, non_blocking=True)
 
-        pred = torch.clamp(model(noisy), 0.0, 1.0)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=bf16):
+            pred = torch.clamp(model(noisy), 0.0, 1.0)
         if not torch.isfinite(pred).all():
             continue
         if is_xla:
@@ -153,10 +156,11 @@ def save_checkpoint(
 
 def run_pipeline(args):
     device = get_device()
-    if device.type == "cuda":
+    if device.type == "cuda" and getattr(torch.version, "hip", None) is None:
         torch.backends.cudnn.benchmark = True
     dev_name = "Cloud TPU v6e-1 (Trillium)" if device.type == "xla" else (torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU")
-    print(f"RepAF-Denoise Net Training Pipeline on {device} ({dev_name})")
+    precision_tag = " [BF16]" if args.bf16 else ""
+    print(f"RepAF-Denoise Net Training Pipeline on {device} ({dev_name}){precision_tag}")
 
     model = RepAFDenoiseNet(c=40).to(device)
 
@@ -207,10 +211,10 @@ def run_pipeline(args):
         patch_size = get_progressive_patch_size(epoch - 1, args.stage1_epochs, min_size=128, max_size=256)
         train_dataset.set_patch_size(patch_size)
 
-        loss = train_one_epoch(model, train_loader_s1, criterion_s1, optimizer_s1, device)
+        loss = train_one_epoch(model, train_loader_s1, criterion_s1, optimizer_s1, device, bf16=args.bf16)
         scheduler_s1.step()
 
-        val_psnr, val_ssim = evaluate(model, val_loader, device)
+        val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16)
         is_best = val_psnr > best_psnr
         if is_best:
             best_psnr = val_psnr
@@ -267,10 +271,10 @@ def run_pipeline(args):
 
     for epoch in range(1, args.stage2_epochs + 1):
         t0 = time.time()
-        loss = train_one_epoch(model, train_loader_s2, criterion_s2, optimizer_s2, device)
+        loss = train_one_epoch(model, train_loader_s2, criterion_s2, optimizer_s2, device, bf16=args.bf16)
         scheduler_s2.step()
 
-        val_psnr, val_ssim = evaluate(model, val_loader, device)
+        val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16)
         is_best = val_psnr > best_psnr
         if is_best:
             best_psnr = val_psnr
@@ -340,6 +344,7 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--export-dir", type=str, default="exports", help="Directory to export models")
     parser.add_argument("--synthetic-samples", type=int, default=128, help="Synthetic samples if no dataset provided")
+    parser.add_argument("--bf16", action="store_true", help="Enable BF16 mixed precision training")
     parser.add_argument("--dry-run", action="store_true", help="Run 1-epoch dry run")
 
     args = parser.parse_args()
