@@ -39,6 +39,7 @@ from inference import run_denoise
 from models import RepAFDenoiseNet
 from process_samples import (
     add_gaussian_noise,
+    apply_blur,
     apply_downsample_upsample,
     apply_jpeg_compression,
     process_all_samples,
@@ -57,10 +58,15 @@ def pil_to_qpixmap(pil_img: Image.Image, max_size: Tuple[int, int] = (900, 650))
         preview = pil_img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.Resampling.BILINEAR)
     else:
         preview = pil_img
-    if preview.mode != "RGB":
-        preview = preview.convert("RGB")
-    data = preview.tobytes("raw", "RGB")
-    qimg = QImage(data, preview.width, preview.height, preview.width * 3, QImage.Format.Format_RGB888)
+
+    if preview.mode == "RGBA":
+        data = preview.tobytes("raw", "RGBA")
+        qimg = QImage(data, preview.width, preview.height, preview.width * 4, QImage.Format.Format_RGBA8888)
+    else:
+        if preview.mode != "RGB":
+            preview = preview.convert("RGB")
+        data = preview.tobytes("raw", "RGB")
+        qimg = QImage(data, preview.width, preview.height, preview.width * 3, QImage.Format.Format_RGB888)
     return QPixmap.fromImage(qimg)
 
 
@@ -107,6 +113,9 @@ class DataGenWorker(QThread):
         quality_range: Optional[tuple] = None,
         num_random_versions: int = 0,
         num_crops: int = 3,
+        p_blur: float = 0.5,
+        blur_type: str = "random",
+        blur_range: Tuple[float, float] = (0.5, 2.5),
     ):
         super().__init__()
         self.samples_dir = samples_dir
@@ -116,6 +125,9 @@ class DataGenWorker(QThread):
         self.quality_range = quality_range
         self.num_random_versions = num_random_versions
         self.num_crops = num_crops
+        self.p_blur = p_blur
+        self.blur_type = blur_type
+        self.blur_range = blur_range
 
     def run(self):
         try:
@@ -128,6 +140,9 @@ class DataGenWorker(QThread):
                 quality_range=self.quality_range,
                 num_random_versions=self.num_random_versions,
                 num_crops=self.num_crops,
+                p_blur=self.p_blur,
+                blur_type=self.blur_type,
+                blur_range=self.blur_range,
                 progress_callback=lambda c: self.progress.emit(c),
             )
             self.finished.emit(count)
@@ -155,7 +170,7 @@ class TrainingWorker(QThread):
             from torch.optim import AdamW
             from torch.optim.lr_scheduler import CosineAnnealingLR
             from torch.utils.data import DataLoader
-            from losses import Stage1Loss, PSNRLoss
+            from losses import Stage1Loss, PSNRLoss, Stage2SharpLoss
             from metrics import calculate_psnr, calculate_ssim
             from train import get_device, get_progressive_patch_size
 
@@ -336,7 +351,7 @@ class TrainingWorker(QThread):
             )
             optimizer_s2 = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
             scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
-            criterion_s2 = PSNRLoss(eps=1e-6).to(device)
+            criterion_s2 = Stage2SharpLoss(eps=1e-6).to(device)
 
             for epoch in range(1, s2_epochs + 1):
                 if self._is_stopped:
@@ -533,8 +548,8 @@ class RepAFDenoiseGUI(QMainWindow):
         self.btn_load_sample = QPushButton("Load Selected Sample")
         self.btn_load_sample.clicked.connect(self._load_sample_image)
 
-        # JPEG Artifact Simulation tool
-        lbl_sim = QLabel("Simulate JPEG Artifacts & Noise:")
+        # Artifact Simulation tool
+        lbl_sim = QLabel("Simulate Degradations & Noise:")
         self.slider_quality = QSlider(Qt.Orientation.Horizontal)
         self.slider_quality.setRange(10, 95)
         self.slider_quality.setValue(35)
@@ -542,6 +557,15 @@ class RepAFDenoiseGUI(QMainWindow):
         self.slider_quality.valueChanged.connect(
             lambda v: self.lbl_quality_val.setText(f"JPEG Quality: {v}")
         )
+
+        self.slider_blur = QSlider(Qt.Orientation.Horizontal)
+        self.slider_blur.setRange(0, 50)
+        self.slider_blur.setValue(0)
+        self.lbl_blur_val = QLabel("Blur Radius: 0.0")
+        self.slider_blur.valueChanged.connect(
+            lambda v: self.lbl_blur_val.setText(f"Blur Radius: {v / 10.0:.1f}")
+        )
+
         self.btn_inject_noise = QPushButton("Inject Degradation to Image")
         self.btn_inject_noise.clicked.connect(self._inject_artifacts_to_image)
 
@@ -553,6 +577,8 @@ class RepAFDenoiseGUI(QMainWindow):
         i_layout.addWidget(lbl_sim)
         i_layout.addWidget(self.lbl_quality_val)
         i_layout.addWidget(self.slider_quality)
+        i_layout.addWidget(self.lbl_blur_val)
+        i_layout.addWidget(self.slider_blur)
         i_layout.addWidget(self.btn_inject_noise)
         c_layout.addWidget(box_img)
 
@@ -756,9 +782,43 @@ class RepAFDenoiseGUI(QMainWindow):
         self.chk_random.toggled.connect(self._on_random_quality_toggled)
         self._on_random_quality_toggled(False)
 
+        self.chk_blur = QCheckBox("Enable Blur")
+        self.chk_blur.setChecked(True)
+        self.spin_p_blur = QDoubleSpinBox()
+        self.spin_p_blur.setRange(0.0, 1.0)
+        self.spin_p_blur.setSingleStep(0.05)
+        self.spin_p_blur.setValue(0.50)
+
+        self.combo_blur_type = QComboBox()
+        self.combo_blur_type.addItems(["random", "gaussian", "motion", "defocus", "box"])
+
+        self.spin_blur_min = QDoubleSpinBox()
+        self.spin_blur_min.setRange(0.1, 10.0)
+        self.spin_blur_min.setValue(0.5)
+
+        self.spin_blur_max = QDoubleSpinBox()
+        self.spin_blur_max.setRange(0.1, 10.0)
+        self.spin_blur_max.setValue(2.5)
+
+        blur_layout = QHBoxLayout()
+        blur_layout.addWidget(self.chk_blur)
+        blur_layout.addSpacing(12)
+        blur_layout.addWidget(QLabel("Prob:"))
+        blur_layout.addWidget(self.spin_p_blur)
+        blur_layout.addSpacing(12)
+        blur_layout.addWidget(QLabel("Type:"))
+        blur_layout.addWidget(self.combo_blur_type)
+        blur_layout.addSpacing(12)
+        blur_layout.addWidget(QLabel("Range:"))
+        blur_layout.addWidget(self.spin_blur_min)
+        blur_layout.addWidget(QLabel("to"))
+        blur_layout.addWidget(self.spin_blur_max)
+        blur_layout.addStretch()
+
         form.addRow("Crops per Image:", self.spin_crops)
         form.addRow("JPEG Quality Levels:", self.edit_qualities)
         form.addRow("Random Quality Mode:", random_layout)
+        form.addRow("Blurring Degradation:", blur_layout)
         v.addLayout(form)
 
         self.btn_run_datagen = QPushButton("Generate Training Pairs")
@@ -844,7 +904,10 @@ class RepAFDenoiseGUI(QMainWindow):
     def _set_active_image(self, file_path: str):
         self.image_path = file_path
         with Image.open(file_path) as raw_img:
-            self.loaded_image = raw_img.convert("RGB")
+            if raw_img.mode in ("RGBA", "LA") or (raw_img.mode == "P" and "transparency" in raw_img.info):
+                self.loaded_image = raw_img.convert("RGBA")
+            else:
+                self.loaded_image = raw_img.convert("RGB")
         self.noisy_image = self.loaded_image.copy()
         self.denoised_image = None
 
@@ -860,16 +923,19 @@ class RepAFDenoiseGUI(QMainWindow):
             return
 
         q = self.slider_quality.value()
-        # Apply progressive degradation
+        blur_val = self.slider_blur.value() / 10.0
         degraded = apply_downsample_upsample(self.loaded_image, scale=0.85)
+        if blur_val > 0.0:
+            degraded = apply_blur(degraded, blur_type="gaussian", strength=blur_val)
         degraded = apply_jpeg_compression(degraded, quality=q)
         degraded = add_gaussian_noise(degraded, sigma=0.02)
 
         self.noisy_image = degraded
         w, h = self.noisy_image.size
-        self.lbl_input_info.setText(f"Resolution: {w} x {h} (JPEG Q={q} + Noise Injected)")
+        blur_str = f" + Blur r={blur_val:.1f}" if blur_val > 0.0 else ""
+        self.lbl_input_info.setText(f"Resolution: {w} x {h} (JPEG Q={q}{blur_str} + Noise Injected)")
         self.view_input.setPixmap(pil_to_qpixmap(self.noisy_image))
-        self.status_label.setText(f"Injected JPEG compression (Q={q}) and sensor noise.")
+        self.status_label.setText(f"Injected JPEG compression (Q={q}){blur_str} and sensor noise.")
 
     def _execute_denoise(self):
         if self.noisy_image is None:
@@ -1025,6 +1091,10 @@ class RepAFDenoiseGUI(QMainWindow):
                 f"Starting data generation with quality levels: {qualities} ({len(qualities)} versions per image/crop)..."
             )
 
+        p_blur = self.spin_p_blur.value() if self.chk_blur.isChecked() else 0.0
+        blur_type = self.combo_blur_type.currentText()
+        blur_range = (self.spin_blur_min.value(), self.spin_blur_max.value())
+
         self.datagen_worker = DataGenWorker(
             samples_dir="samples",
             clean_dir="samples/processed/clean",
@@ -1033,6 +1103,9 @@ class RepAFDenoiseGUI(QMainWindow):
             quality_range=quality_range,
             num_random_versions=num_random_versions,
             num_crops=self.spin_crops.value(),
+            p_blur=p_blur,
+            blur_type=blur_type,
+            blur_range=blur_range,
         )
         self.datagen_worker.log_signal.connect(lambda msg: self.datagen_log.append(msg))
         self.datagen_worker.progress.connect(lambda c: self.datagen_log.append(f"Generated pair #{c}"))

@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from dataset import DenoisingDataset
 from export import export_int8_quantization, export_onnx
-from losses import PSNRLoss, Stage1Loss
+from losses import PSNRLoss, Stage1Loss, Stage2SharpLoss
 from metrics import calculate_psnr, calculate_ssim
 from models import RepAFDenoiseNet, test_reparameterization_equivalence
 
@@ -301,7 +301,7 @@ def run_pipeline(args):
 
     optimizer_s2 = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
     scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=args.stage2_epochs, eta_min=1e-6)
-    criterion_s2 = PSNRLoss(data_range=1.0, eps=1e-6).to(device)
+    criterion_s2 = Stage2SharpLoss(data_range=1.0, eps=1e-6).to(device)
 
     for epoch in range(1, args.stage2_epochs + 1):
         t0 = time.time()

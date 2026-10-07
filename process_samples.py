@@ -9,12 +9,85 @@ import threading
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
+
+
+def composite_rgba_to_rgb(img: Image.Image, bg_color: Tuple[int, int, int] = (255, 255, 255)) -> Image.Image:
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGBA", rgba.size, (*bg_color, 255))
+        return Image.alpha_composite(bg, rgba).convert("RGB")
+    return img.convert("RGB")
+
+
+def create_motion_blur_kernel(kernel_size: int, angle_deg: float) -> np.ndarray:
+    kernel = np.zeros((kernel_size, kernel_size), dtype=np.float32)
+    center = kernel_size // 2
+    theta = np.deg2rad(angle_deg)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    for i in range(-center, center + 1):
+        x = int(round(center + i * cos_t))
+        y = int(round(center + i * sin_t))
+        if 0 <= x < kernel_size and 0 <= y < kernel_size:
+            kernel[y, x] = 1.0
+    total = kernel.sum()
+    return kernel / total if total > 0 else np.ones((kernel_size, kernel_size), dtype=np.float32) / (kernel_size * kernel_size)
+
+
+def create_defocus_kernel(radius: int) -> np.ndarray:
+    size = radius * 2 + 1
+    y, x = np.ogrid[-radius : radius + 1, -radius : radius + 1]
+    mask = x * x + y * y <= radius * radius
+    kernel = np.zeros((size, size), dtype=np.float32)
+    kernel[mask] = 1.0
+    total = kernel.sum()
+    return kernel / total if total > 0 else np.ones((size, size), dtype=np.float32) / (size * size)
+
+
+def apply_blur(
+    img: Image.Image,
+    blur_type: str = "gaussian",
+    strength: float = 1.5,
+    rng: Optional[random.Random] = None,
+) -> Image.Image:
+    if strength <= 0.1 or blur_type == "none":
+        return img
+
+    r = rng if rng is not None else random.Random()
+    b_type = blur_type
+    if b_type == "random":
+        b_type = r.choice(["gaussian", "motion", "defocus", "box"])
+
+    if b_type == "gaussian":
+        return img.filter(ImageFilter.GaussianBlur(radius=strength))
+    elif b_type == "box":
+        return img.filter(ImageFilter.BoxBlur(radius=max(1, int(round(strength)))))
+    elif b_type == "motion":
+        k_size = max(3, int(round(strength * 2 + 1)) | 1)
+        angle = r.uniform(0.0, 360.0)
+        kernel = create_motion_blur_kernel(k_size, angle)
+        filt = ImageFilter.Kernel((k_size, k_size), kernel.flatten().tolist(), scale=1.0, offset=0)
+        return img.filter(filt)
+    elif b_type == "defocus":
+        rad = max(1, int(round(strength)))
+        kernel = create_defocus_kernel(rad)
+        k_size = rad * 2 + 1
+        filt = ImageFilter.Kernel((k_size, k_size), kernel.flatten().tolist(), scale=1.0, offset=0)
+        return img.filter(filt)
+    return img
 
 
 def apply_jpeg_compression(img: Image.Image, quality: int) -> Image.Image:
+    if img.mode in ("RGBA", "LA"):
+        rgba = img.convert("RGBA")
+        rgb = rgba.convert("RGB")
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=quality)
+        buffer.seek(0)
+        jpeg_rgb = Image.open(buffer).convert("RGB")
+        return Image.merge("RGBA", (*jpeg_rgb.split(), rgba.split()[-1]))
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=quality)
+    img.convert("RGB").save(buffer, format="JPEG", quality=quality)
     buffer.seek(0)
     return Image.open(buffer).convert("RGB")
 
@@ -35,6 +108,12 @@ def add_realistic_noise(
 ) -> Image.Image:
     if sigma <= 0.0 or noise_type == "none":
         return img
+
+    if img.mode == "RGBA":
+        r, g, b, a = img.split()
+        rgb_img = Image.merge("RGB", (r, g, b))
+        noisy_rgb = add_realistic_noise(rgb_img, noise_type=noise_type, sigma=sigma, rng=rng)
+        return Image.merge("RGBA", (*noisy_rgb.split(), a))
 
     gen = rng if rng is not None else np.random.default_rng()
     arr = np.array(img, dtype=np.float32) / 255.0
@@ -161,6 +240,9 @@ def process_sample_image(
     p_jpeg: float = 0.7,
     p_downsample: float = 0.4,
     downsample_range: Tuple[float, float] = (0.70, 0.95),
+    p_blur: float = 0.5,
+    blur_type: str = "random",
+    blur_range: Tuple[float, float] = (0.5, 2.5),
     seed: int = 42,
     progress_callback=None,
     num_random_versions: int = 0,
@@ -170,7 +252,7 @@ def process_sample_image(
 
     try:
         with Image.open(image_path) as raw_img:
-            img = raw_img.convert("RGB")
+            img = composite_rgba_to_rgb(raw_img)
     except Exception as e:
         print(f"Warning: Failed to open image {image_path}: {e}")
         return []
@@ -199,6 +281,7 @@ def process_sample_image(
     is_pure_denoise = (task_mode == "denoise")
     effective_p_jpeg = 0.0 if is_pure_denoise else p_jpeg
     effective_p_down = 0.0 if is_pure_denoise else p_downsample
+    effective_p_blur = 0.0 if is_pure_denoise else p_blur
     effective_p_noise = 1.0 if is_pure_denoise else p_noise
 
     generated_metadata: List[Dict] = []
@@ -215,16 +298,24 @@ def process_sample_image(
             noisy_patch = clean_patch
 
             apply_down = s_rng.random() < effective_p_down
+            apply_blur_flag = s_rng.random() < effective_p_blur
             apply_jpeg = s_rng.random() < effective_p_jpeg
             apply_noise = s_rng.random() < effective_p_noise
 
-            if not is_pure_denoise and not (apply_down or apply_jpeg or apply_noise):
+            if not is_pure_denoise and not (apply_down or apply_blur_flag or apply_jpeg or apply_noise):
                 apply_noise = True
 
             resize_scale = None
             if apply_down:
                 resize_scale = round(s_rng.uniform(downsample_range[0], downsample_range[1]), 3)
                 noisy_patch = apply_downsample_upsample(noisy_patch, resize_scale)
+
+            blur_strength = 0.0
+            actual_blur_type = "none"
+            if apply_blur_flag:
+                blur_strength = round(s_rng.uniform(blur_range[0], blur_range[1]), 2)
+                actual_blur_type = blur_type if blur_type != "random" else s_rng.choice(["gaussian", "motion", "defocus", "box"])
+                noisy_patch = apply_blur(noisy_patch, blur_type=actual_blur_type, strength=blur_strength, rng=s_rng)
 
             jpeg_quality = None
             if apply_jpeg:
@@ -278,6 +369,8 @@ def process_sample_image(
                 "crop_size": [patch_size, patch_size],
                 "noise_type": actual_noise_type,
                 "noise_sigma": noise_sigma,
+                "blur_type": actual_blur_type,
+                "blur_strength": blur_strength,
                 "jpeg_quality": jpeg_quality,
                 "resize_scale": resize_scale,
                 "seed": sample_seed,
@@ -310,6 +403,9 @@ def process_all_samples(
     p_jpeg: float = 0.7,
     p_downsample: float = 0.4,
     downsample_range: Tuple[float, float] = (0.70, 0.95),
+    p_blur: float = 0.5,
+    blur_type: str = "random",
+    blur_range: Tuple[float, float] = (0.5, 2.5),
     seed: int = 42,
     progress_callback=None,
     max_workers: Optional[int] = None,
@@ -380,6 +476,9 @@ def process_all_samples(
                 p_jpeg=p_jpeg,
                 p_downsample=p_downsample,
                 downsample_range=downsample_range,
+                p_blur=p_blur,
+                blur_type=blur_type,
+                blur_range=blur_range,
                 seed=img_seed,
                 progress_callback=wrapped_cb if progress_callback else None,
                 num_random_versions=num_random_versions,
@@ -415,6 +514,9 @@ def process_all_samples(
             "jpeg_range": list(quality_range) if quality_range else None,
             "p_downsample": p_downsample,
             "downsample_range": list(downsample_range),
+            "p_blur": p_blur,
+            "blur_type": blur_type,
+            "blur_range": list(blur_range),
         },
         "stats": {
             "expected_samples": expected_samples,
@@ -450,6 +552,9 @@ if __name__ == "__main__":
     parser.add_argument("--p-jpeg", type=float, default=0.7, help="Probability of applying JPEG compression (restoration mode)")
     parser.add_argument("--p-downsample", type=float, default=0.4, help="Probability of downsample/upsample degradation")
     parser.add_argument("--downsample-range", nargs=2, type=float, default=[0.70, 0.95], help="Downsample scale range (min max)")
+    parser.add_argument("--p-blur", type=float, default=0.5, help="Probability of applying blur degradation")
+    parser.add_argument("--blur-type", default="random", choices=["random", "gaussian", "motion", "defocus", "box"], help="Blur type")
+    parser.add_argument("--blur-range", nargs=2, type=float, default=[0.5, 2.5], help="Blur strength range (min max)")
     parser.add_argument("--split-ratios", nargs=3, type=float, default=[0.8, 0.2, 0.0], help="Train/val/test split ratios")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--workers", type=int, default=None, help="Max worker threads")
@@ -473,6 +578,9 @@ if __name__ == "__main__":
         p_jpeg=args.p_jpeg,
         p_downsample=args.p_downsample,
         downsample_range=tuple(args.downsample_range),
+        p_blur=args.p_blur,
+        blur_type=args.blur_type,
+        blur_range=tuple(args.blur_range),
         seed=args.seed,
         max_workers=args.workers,
     )

@@ -181,9 +181,18 @@ def run_denoise(
 ) -> Tuple[Image.Image, float]:
     if isinstance(image, str):
         with Image.open(image) as raw_img:
-            pil_img = raw_img.convert("RGB")
+            input_img = raw_img.copy()
     else:
-        pil_img = image.convert("RGB")
+        input_img = image
+
+    has_alpha = input_img.mode in ("RGBA", "LA") or (input_img.mode == "P" and "transparency" in input_img.info)
+    alpha_channel = None
+    if has_alpha:
+        rgba = input_img.convert("RGBA")
+        alpha_channel = rgba.split()[-1]
+        pil_img = rgba.convert("RGB")
+    else:
+        pil_img = input_img.convert("RGB")
 
     w, h = pil_img.size
     is_onnx = model_path.lower().endswith(".onnx")
@@ -276,6 +285,9 @@ def run_denoise(
                 xm.mark_step()
             except Exception:
                 pass
+
+    if has_alpha and alpha_channel is not None:
+        denoised_img = Image.merge("RGBA", (*denoised_img.split(), alpha_channel))
 
     elapsed_ms = (time.time() - t0) * 1000.0
     return denoised_img, elapsed_ms

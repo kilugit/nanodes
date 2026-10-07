@@ -36,15 +36,30 @@ class SpatialGradientLoss(nn.Module):
         return (self.lambda_grad * 2.0) * g.abs().mean()
 
 
+class LaplacianLoss(nn.Module):
+    def __init__(self, lambda_lap: float = 0.02, channels: int = 3):
+        super().__init__()
+        self.lambda_lap = lambda_lap
+        self.channels = channels
+        lap = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32).view(1, 1, 3, 3)
+        self.register_buffer("lap", lap.repeat(channels, 1, 1, 1))
+
+    def forward(self, pred: torch.Tensor, target: Optional[torch.Tensor] = None) -> torch.Tensor:
+        diff = pred - target if target is not None else pred
+        curv = F.conv2d(diff, self.lap, padding=1, groups=self.channels)
+        return self.lambda_lap * curv.abs().mean()
+
+
 class Stage1Loss(nn.Module):
-    def __init__(self, eps: float = 1e-3, lambda_grad: float = 0.05, channels: int = 3):
+    def __init__(self, eps: float = 1e-3, lambda_grad: float = 0.05, lambda_lap: float = 0.02, channels: int = 3):
         super().__init__()
         self.charbonnier = CharbonnierLoss(eps=eps)
         self.gradient = SpatialGradientLoss(lambda_grad=lambda_grad, channels=channels)
+        self.laplacian = LaplacianLoss(lambda_lap=lambda_lap, channels=channels)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = pred - target
-        return self.charbonnier(diff, None) + self.gradient(diff, None)
+        return self.charbonnier(diff) + self.gradient(diff) + self.laplacian(diff)
 
 
 class PSNRLoss(nn.Module):
@@ -57,3 +72,22 @@ class PSNRLoss(nn.Module):
         diff = pred - target
         mse = torch.mean(diff.square())
         return -10.0 * torch.log10(self.scale / (mse + self.eps))
+
+
+class Stage2SharpLoss(nn.Module):
+    def __init__(
+        self,
+        data_range: float = 1.0,
+        eps: float = 1e-6,
+        lambda_grad: float = 0.05,
+        lambda_lap: float = 0.02,
+        channels: int = 3,
+    ):
+        super().__init__()
+        self.psnr = PSNRLoss(data_range=data_range, eps=eps)
+        self.gradient = SpatialGradientLoss(lambda_grad=lambda_grad, channels=channels)
+        self.laplacian = LaplacianLoss(lambda_lap=lambda_lap, channels=channels)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        diff = pred - target
+        return self.psnr(pred, target) + self.gradient(diff) + self.laplacian(diff)

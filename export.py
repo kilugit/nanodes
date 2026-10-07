@@ -121,10 +121,12 @@ class _ImageCalibrationDataReader:
             for ext in exts:
                 paths.extend(glob.glob(os.path.join(samples_dir, ext)))
 
+        from process_samples import composite_rgba_to_rgb
+
         for p in paths[:num_samples]:
             try:
                 with Image.open(p) as raw_img:
-                    img = raw_img.convert("RGB").resize((input_shape[3], input_shape[2]))
+                    img = composite_rgba_to_rgb(raw_img).resize((input_shape[3], input_shape[2]))
                 arr = np.array(img, dtype=np.float32).transpose(2, 0, 1) / 255.0
                 self.data.append({"noisy_image": np.expand_dims(arr, axis=0)})
             except Exception:

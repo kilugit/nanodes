@@ -157,7 +157,11 @@ class DenoisingDataset(Dataset):
             base_size = max(512, self.patch_size)
             clean = torch.rand(3, base_size, base_size, dtype=torch.float32)
             noise_std = random.uniform(0.02, 0.10)
-            noisy = torch.clamp(clean + torch.randn_like(clean) * noise_std, 0.0, 1.0)
+            noisy = clean
+            if random.random() < 0.5:
+                k = random.choice([3, 5])
+                noisy = F.avg_pool2d(noisy.unsqueeze(0), kernel_size=k, stride=1, padding=k // 2).squeeze(0)
+            noisy = torch.clamp(noisy + torch.randn_like(noisy) * noise_std, 0.0, 1.0)
             if self.patch_size:
                 noisy, clean = paired_crop(noisy, clean, self.patch_size, is_train=self.is_train)
             if self.is_train:
