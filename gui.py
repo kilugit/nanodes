@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
 
 from dataset import DenoisingDataset, set_max_cache_items
 from inference import run_denoise
-from models import RepAFDenoiseNet
+from models import RepAFDenoiseNet, load_pretrained_weights
 from process_samples import (
     add_gaussian_noise,
     apply_blur,
@@ -217,128 +217,165 @@ class TrainingWorker(QThread):
             amp_enabled = (fp16 or bf16) and device.type == "cuda"
             scaler = torch.amp.GradScaler("cuda", enabled=(fp16 and device.type == "cuda"))
 
-            # Stage 1
-            s1_epochs = self.config["stage1_epochs"]
-            self.log_signal.emit(f"\n--- Starting Stage 1 ({s1_epochs} epochs) ---")
-            optimizer_s1 = AdamW(model.parameters(), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
-            scheduler_s1 = CosineAnnealingLR(optimizer_s1, T_max=s1_epochs, eta_min=1e-6)
-            criterion_s1 = Stage1Loss(eps=1e-3, lambda_grad=0.05).to(device)
+            is_finetune = self.config.get("is_finetune", False)
+            pretrained_path = self.config.get("pretrained_path")
+            if is_finetune and pretrained_path and os.path.exists(pretrained_path):
+                ckpt_info = load_pretrained_weights(model, pretrained_path, device=device)
+                best_psnr = ckpt_info.get("best_psnr", -float("inf"))
+                self.log_signal.emit(f"Loaded pre-trained weights from: {pretrained_path}")
 
-            loader_s1 = DataLoader(
-                train_dataset,
-                batch_size=self.config["batch_size_stage1"],
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=(device.type == "cuda"),
-                persistent_workers=(num_workers > 0),
-                drop_last=(len(train_dataset) >= self.config["batch_size_stage1"]),
-            )
+            if self.config.get("freeze_stem", False):
+                for p in model.stem.parameters():
+                    p.requires_grad = False
+                self.log_signal.emit("Stem feature extractor frozen.")
 
-            for epoch in range(1, s1_epochs + 1):
-                if self._is_stopped:
-                    self.log_signal.emit("Training cancelled by user.")
-                    self.finished.emit("Cancelled")
-                    return
+            if is_finetune:
+                self.log_signal.emit("Evaluating baseline validation performance...")
+                model.eval()
+                total_psnr = torch.zeros(1, device=device)
+                total_ssim = torch.zeros(1, device=device)
+                count = 0
+                with torch.inference_mode():
+                    for noisy, clean in val_loader:
+                        noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            pred = torch.clamp(model(noisy), 0.0, 1.0)
+                        bs = noisy.size(0)
+                        total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
+                        total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
+                        count += bs
+                base_psnr = (total_psnr / count).item() if count > 0 else 0.0
+                base_ssim = (total_ssim / count).item() if count > 0 else 0.0
+                if base_psnr > best_psnr:
+                    best_psnr = base_psnr
+                self.log_signal.emit(f"Pre-trained Baseline -> Val PSNR: {base_psnr:.2f} dB | SSIM: {base_ssim:.4f}")
+            else:
+                # Stage 1
+                s1_epochs = self.config["stage1_epochs"]
+                self.log_signal.emit(f"\n--- Starting Stage 1 ({s1_epochs} epochs) ---")
+                optimizer_s1 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
+                scheduler_s1 = CosineAnnealingLR(optimizer_s1, T_max=s1_epochs, eta_min=1e-6)
+                criterion_s1 = Stage1Loss(eps=1e-3, lambda_grad=0.05).to(device)
 
-                patch_size = get_progressive_patch_size(epoch - 1, s1_epochs, min_size=128, max_size=256)
-                train_dataset.set_patch_size(patch_size)
-
-                model.train()
-                epoch_loss = 0.0
-                valid_count = 0
-                for noisy, clean in loader_s1:
-                    if self._is_stopped:
-                        break
-                    noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                    optimizer_s1.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                        loss = criterion_s1(model(noisy), clean)
-                    if not torch.isfinite(loss) or loss.abs().item() > 100.0:
-                        continue
-                    if scaler.is_enabled():
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(optimizer_s1)
-                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        if torch.isfinite(grad_norm):
-                            scaler.step(optimizer_s1)
-                            scaler.update()
-                            epoch_loss += loss.item() * noisy.size(0)
-                            valid_count += noisy.size(0)
-                        else:
-                            optimizer_s1.zero_grad(set_to_none=True)
-                            scaler.update()
-                    else:
-                        loss.backward()
-                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        if torch.isfinite(grad_norm):
-                            optimizer_s1.step()
-                            epoch_loss += loss.item() * noisy.size(0)
-                            valid_count += noisy.size(0)
-                        else:
-                            optimizer_s1.zero_grad(set_to_none=True)
-
-                if self._is_stopped:
-                    self.log_signal.emit("Training cancelled by user.")
-                    self.finished.emit("Cancelled")
-                    return
-
-                scheduler_s1.step()
-                mean_loss = epoch_loss / valid_count if valid_count > 0 else float("nan")
-
-                should_eval = (epoch % eval_interval == 0) or (epoch == s1_epochs)
-                if should_eval:
-                    model.eval()
-                    total_psnr = torch.zeros(1, device=device)
-                    total_ssim = torch.zeros(1, device=device)
-                    count = 0
-                    with torch.inference_mode():
-                        for noisy, clean in val_loader:
-                            if self._is_stopped:
-                                self.log_signal.emit("Training cancelled by user.")
-                                self.finished.emit("Cancelled")
-                                return
-                            noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-                                pred = torch.clamp(model(noisy), 0.0, 1.0)
-                            if not torch.isfinite(pred).all():
-                                continue
-                            bs = noisy.size(0)
-                            total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
-                            total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
-                            count += bs
-                    val_psnr = (total_psnr / count).item() if count > 0 else 0.0
-                    val_ssim = (total_ssim / count).item() if count > 0 else 0.0
-
-                    is_best = val_psnr > best_psnr
-                    if is_best:
-                        best_psnr = val_psnr
-                        torch.save(
-                            {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 1},
-                            os.path.join(save_dir, "best_model.pth"),
-                        )
-                    val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
-                else:
-                    val_str = "Val: (skipped)"
-
-                self.epoch_progress.emit(epoch, s1_epochs + self.config["stage2_epochs"])
-                self.log_signal.emit(
-                    f"S1 [Epoch {epoch:03d}/{s1_epochs:03d}] Patch: {patch_size}x{patch_size} | "
-                    f"Loss: {mean_loss:.4f} | {val_str}"
+                loader_s1 = DataLoader(
+                    train_dataset,
+                    batch_size=self.config["batch_size_stage1"],
+                    shuffle=True,
+                    num_workers=num_workers,
+                    pin_memory=(device.type == "cuda"),
+                    persistent_workers=(num_workers > 0),
+                    drop_last=(len(train_dataset) >= self.config["batch_size_stage1"]),
                 )
 
-            del optimizer_s1, scheduler_s1, criterion_s1, loader_s1
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+                for epoch in range(1, s1_epochs + 1):
+                    if self._is_stopped:
+                        self.log_signal.emit("Training cancelled by user.")
+                        self.finished.emit("Cancelled")
+                        return
 
-            best_ckpt = os.path.join(save_dir, "best_model.pth")
-            if os.path.exists(best_ckpt):
-                ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
-                model.load_state_dict(ckpt["state_dict"])
-                best_psnr = ckpt.get("best_psnr", best_psnr)
+                    patch_size = get_progressive_patch_size(epoch - 1, s1_epochs, min_size=128, max_size=256)
+                    train_dataset.set_patch_size(patch_size)
 
-            # Stage 2
-            s2_epochs = self.config["stage2_epochs"]
-            self.log_signal.emit(f"\n--- Starting Stage 2 ({s2_epochs} epochs) ---")
+                    model.train()
+                    epoch_loss = 0.0
+                    valid_count = 0
+                    for noisy, clean in loader_s1:
+                        if self._is_stopped:
+                            break
+                        noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                        optimizer_s1.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            loss = criterion_s1(model(noisy), clean)
+                        if not torch.isfinite(loss) or loss.abs().item() > 100.0:
+                            continue
+                        if scaler.is_enabled():
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer_s1)
+                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            if torch.isfinite(grad_norm):
+                                scaler.step(optimizer_s1)
+                                scaler.update()
+                                epoch_loss += loss.item() * noisy.size(0)
+                                valid_count += noisy.size(0)
+                            else:
+                                optimizer_s1.zero_grad(set_to_none=True)
+                                scaler.update()
+                        else:
+                            loss.backward()
+                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            if torch.isfinite(grad_norm):
+                                optimizer_s1.step()
+                                epoch_loss += loss.item() * noisy.size(0)
+                                valid_count += noisy.size(0)
+                            else:
+                                optimizer_s1.zero_grad(set_to_none=True)
+
+                    if self._is_stopped:
+                        self.log_signal.emit("Training cancelled by user.")
+                        self.finished.emit("Cancelled")
+                        return
+
+                    scheduler_s1.step()
+                    mean_loss = epoch_loss / valid_count if valid_count > 0 else float("nan")
+
+                    should_eval = (epoch % eval_interval == 0) or (epoch == s1_epochs)
+                    if should_eval:
+                        model.eval()
+                        total_psnr = torch.zeros(1, device=device)
+                        total_ssim = torch.zeros(1, device=device)
+                        count = 0
+                        with torch.inference_mode():
+                            for noisy, clean in val_loader:
+                                if self._is_stopped:
+                                    self.log_signal.emit("Training cancelled by user.")
+                                    self.finished.emit("Cancelled")
+                                    return
+                                noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                                    pred = torch.clamp(model(noisy), 0.0, 1.0)
+                                if not torch.isfinite(pred).all():
+                                    continue
+                                bs = noisy.size(0)
+                                total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
+                                total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
+                                count += bs
+                        val_psnr = (total_psnr / count).item() if count > 0 else 0.0
+                        val_ssim = (total_ssim / count).item() if count > 0 else 0.0
+
+                        is_best = val_psnr > best_psnr
+                        if is_best:
+                            best_psnr = val_psnr
+                            torch.save(
+                                {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 1},
+                                os.path.join(save_dir, "best_model.pth"),
+                            )
+                        val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
+                    else:
+                        val_str = "Val: (skipped)"
+
+                    self.epoch_progress.emit(epoch, s1_epochs + self.config["stage2_epochs"])
+                    self.log_signal.emit(
+                        f"S1 [Epoch {epoch:03d}/{s1_epochs:03d}] Patch: {patch_size}x{patch_size} | "
+                        f"Loss: {mean_loss:.4f} | {val_str}"
+                    )
+
+                del optimizer_s1, scheduler_s1, criterion_s1, loader_s1
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+                best_ckpt = os.path.join(save_dir, "best_model.pth")
+                if os.path.exists(best_ckpt):
+                    ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+                    model.load_state_dict(ckpt["state_dict"])
+                    best_psnr = ckpt.get("best_psnr", best_psnr)
+
+            # Stage 2 / Fine-Tuning
+            s2_epochs = self.config.get("finetune_epochs", 30) if is_finetune else self.config["stage2_epochs"]
+            s2_lr = self.config.get("finetune_lr", 5e-5) if is_finetune else 1e-4
+            stage_tag = "Fine-Tune" if is_finetune else "S2"
+            total_epochs = s2_epochs if is_finetune else s1_epochs + s2_epochs
+
+            self.log_signal.emit(f"\n--- Starting {stage_tag} ({s2_epochs} epochs) ---")
             train_dataset.set_patch_size(256)
             loader_s2 = DataLoader(
                 train_dataset,
@@ -349,7 +386,7 @@ class TrainingWorker(QThread):
                 persistent_workers=(num_workers > 0),
                 drop_last=(len(train_dataset) >= self.config["batch_size_stage2"]),
             )
-            optimizer_s2 = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
+            optimizer_s2 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=s2_lr, betas=(0.9, 0.999), weight_decay=1e-4)
             scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
             criterion_s2 = Stage2SharpLoss(eps=1e-6).to(device)
 
@@ -429,18 +466,38 @@ class TrainingWorker(QThread):
                     if is_best:
                         best_psnr = val_psnr
                         torch.save(
-                            {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 2},
+                            {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 2 if not is_finetune else "finetune"},
                             os.path.join(save_dir, "best_model.pth"),
                         )
+                        if is_finetune:
+                            torch.save(
+                                {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": "finetune"},
+                                os.path.join(save_dir, "finetuned_best.pth"),
+                            )
                     val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
                 else:
                     val_str = "Val: (skipped)"
 
-                self.epoch_progress.emit(s1_epochs + epoch, s1_epochs + s2_epochs)
+                current_epoch = epoch if is_finetune else s1_epochs + epoch
+                self.epoch_progress.emit(current_epoch, total_epochs)
                 self.log_signal.emit(
-                    f"S2 [Epoch {epoch:02d}/{s2_epochs:02d}] Patch: 256x256 | "
+                    f"{stage_tag} [Epoch {epoch:02d}/{s2_epochs:02d}] Patch: 256x256 | "
                     f"PSNR Loss: {mean_loss:.4f} | {val_str}"
                 )
+
+            # Export deployed models for immediate inference use
+            try:
+                from export import _prepare_cpu_deploy_model, export_onnx
+                best_ckpt = os.path.join(save_dir, "best_model.pth")
+                if os.path.exists(best_ckpt):
+                    ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+                    model.load_state_dict(ckpt["state_dict"])
+                deploy_model = _prepare_cpu_deploy_model(model)
+                torch.save(deploy_model.state_dict(), os.path.join(save_dir, "repaf_denoise_net_deployed.pth"))
+                export_onnx(deploy_model, save_path="onnx models/repaf_denoise_net.onnx")
+                self.log_signal.emit("Auto-exported deployed PyTorch and ONNX models for inference.")
+            except Exception as exp_err:
+                self.log_signal.emit(f"Note: Deployed export: {exp_err}")
 
             self.log_signal.emit(f"\nTraining Complete! Best PSNR: {best_psnr:.2f} dB")
             self.finished.emit("Success")
@@ -640,6 +697,51 @@ class RepAFDenoiseGUI(QMainWindow):
     def _setup_training_tab(self):
         layout = QVBoxLayout(self.tab_training)
 
+        mode_box = QGroupBox("Fine-Tuning Mode")
+        m_layout = QVBoxLayout(mode_box)
+
+        self.chk_finetune_mode = QCheckBox("Fine-Tune Pre-trained Model (Skip Stage 1 coarse training)")
+        self.chk_finetune_mode.setStyleSheet("font-weight: bold; color: #64b5f6;")
+        self.chk_finetune_mode.toggled.connect(self._on_finetune_mode_toggled)
+
+        ft_row = QHBoxLayout()
+        ft_row.addWidget(QLabel("Checkpoint:"))
+        self.combo_pretrained_model = QComboBox()
+        self.btn_browse_pretrained = QPushButton("Browse...")
+        self.btn_browse_pretrained.clicked.connect(self._browse_pretrained_model)
+        self.btn_refresh_checkpoints = QPushButton("Refresh")
+        self.btn_refresh_checkpoints.clicked.connect(self._refresh_checkpoint_models)
+        ft_row.addWidget(self.combo_pretrained_model, 1)
+        ft_row.addWidget(self.btn_browse_pretrained)
+        ft_row.addWidget(self.btn_refresh_checkpoints)
+
+        ft_opts_row = QHBoxLayout()
+        self.spin_ft_epochs = QSpinBox()
+        self.spin_ft_epochs.setRange(1, 10000)
+        self.spin_ft_epochs.setValue(30)
+
+        self.spin_ft_lr = QDoubleSpinBox()
+        self.spin_ft_lr.setRange(0.000001, 0.01)
+        self.spin_ft_lr.setDecimals(6)
+        self.spin_ft_lr.setSingleStep(0.00001)
+        self.spin_ft_lr.setValue(0.00005)
+
+        self.chk_freeze_stem = QCheckBox("Freeze Stem")
+
+        ft_opts_row.addWidget(QLabel("Fine-Tune Epochs:"))
+        ft_opts_row.addWidget(self.spin_ft_epochs)
+        ft_opts_row.addSpacing(15)
+        ft_opts_row.addWidget(QLabel("Learning Rate:"))
+        ft_opts_row.addWidget(self.spin_ft_lr)
+        ft_opts_row.addSpacing(15)
+        ft_opts_row.addWidget(self.chk_freeze_stem)
+        ft_opts_row.addStretch()
+
+        m_layout.addWidget(self.chk_finetune_mode)
+        m_layout.addLayout(ft_row)
+        m_layout.addLayout(ft_opts_row)
+        layout.addWidget(mode_box)
+
         cfg_box = QGroupBox("Training Settings")
         grid = QGridLayout(cfg_box)
 
@@ -731,6 +833,9 @@ class RepAFDenoiseGUI(QMainWindow):
         self.train_log.setReadOnly(True)
         self.train_log.setStyleSheet("background-color: #121212; color: #76ff03; font-family: Consolas, monospace;")
         layout.addWidget(self.train_log)
+
+        self._refresh_checkpoint_models()
+        self._on_finetune_mode_toggled(False)
 
     # -------------------------------------------------------------------------
     # Tab 3: Sample Data Generation
@@ -996,11 +1101,60 @@ class RepAFDenoiseGUI(QMainWindow):
     # -------------------------------------------------------------------------
     # Training Tab Actions
     # -------------------------------------------------------------------------
+    def _on_finetune_mode_toggled(self, checked: bool):
+        self.combo_pretrained_model.setEnabled(checked)
+        self.btn_browse_pretrained.setEnabled(checked)
+        self.btn_refresh_checkpoints.setEnabled(checked)
+        self.spin_ft_epochs.setEnabled(checked)
+        self.spin_ft_lr.setEnabled(checked)
+        self.chk_freeze_stem.setEnabled(checked)
+
+        self.spin_s1_epochs.setEnabled(not checked)
+        self.spin_s1_batch.setEnabled(not checked)
+        self.btn_start_train.setText("Start Fine-Tuning Pipeline" if checked else "Start Training Pipeline")
+
+    def _refresh_checkpoint_models(self):
+        current = self.combo_pretrained_model.currentText()
+        self.combo_pretrained_model.clear()
+        found = []
+        for d in ["checkpoints", "pytorch models"]:
+            if os.path.exists(d):
+                for f in os.listdir(d):
+                    if f.endswith(".pth"):
+                        found.append(os.path.normpath(os.path.join(d, f)))
+        for p in sorted(set(found)):
+            self.combo_pretrained_model.addItem(p)
+        if current and self.combo_pretrained_model.findText(current) >= 0:
+            self.combo_pretrained_model.setCurrentText(current)
+
+    def _browse_pretrained_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Pre-trained Checkpoint", "", "PyTorch Models (*.pth *.pt);;All Files (*.*)"
+        )
+        if path:
+            norm_path = os.path.normpath(path)
+            idx = self.combo_pretrained_model.findText(norm_path)
+            if idx < 0:
+                self.combo_pretrained_model.addItem(norm_path)
+                idx = self.combo_pretrained_model.count() - 1
+            self.combo_pretrained_model.setCurrentIndex(idx)
+
     def _start_training(self):
         if hasattr(self, "train_worker") and self.train_worker.isRunning():
             return
 
+        is_finetune = self.chk_finetune_mode.isChecked()
+        pretrained_path = self.combo_pretrained_model.currentText().strip() if is_finetune else None
+        if is_finetune and (not pretrained_path or not os.path.exists(pretrained_path)):
+            QMessageBox.warning(self, "Invalid Checkpoint", "Please select a valid pre-trained .pth checkpoint to fine-tune.")
+            return
+
         config = {
+            "is_finetune": is_finetune,
+            "pretrained_path": pretrained_path,
+            "finetune_epochs": self.spin_ft_epochs.value(),
+            "finetune_lr": self.spin_ft_lr.value(),
+            "freeze_stem": self.chk_freeze_stem.isChecked(),
             "stage1_epochs": self.spin_s1_epochs.value(),
             "stage2_epochs": self.spin_s2_epochs.value(),
             "batch_size_stage1": self.spin_s1_batch.value(),

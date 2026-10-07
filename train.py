@@ -13,7 +13,7 @@ from dataset import DenoisingDataset
 from export import export_int8_quantization, export_onnx
 from losses import PSNRLoss, Stage1Loss, Stage2SharpLoss
 from metrics import calculate_psnr, calculate_ssim
-from models import RepAFDenoiseNet, test_reparameterization_equivalence
+from models import RepAFDenoiseNet, load_pretrained_weights, test_reparameterization_equivalence
 
 
 def get_device() -> torch.device:
@@ -208,6 +208,10 @@ def run_pipeline(args):
         preload_to_ram=args.preload_ram,
     )
 
+    if args.dry_run:
+        train_dataset.paired_files = train_dataset.paired_files[:8]
+        val_dataset.paired_files = val_dataset.paired_files[:4]
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size_val,
@@ -218,76 +222,100 @@ def run_pipeline(args):
 
     best_psnr = -float("inf")
 
-    # Stage 1: Coarse Training with Progressive Patch Sizes
-    print(f"\nStage 1: {args.stage1_epochs} epochs | Batch Size: {args.batch_size_stage1}")
-    optimizer_s1 = AdamW(model.parameters(), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
-    scheduler_s1 = CosineAnnealingLR(optimizer_s1, T_max=args.stage1_epochs, eta_min=1e-6)
-    criterion_s1 = Stage1Loss(eps=1e-3, lambda_grad=0.05).to(device)
-
-    train_loader_s1 = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size_stage1,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
-        drop_last=(len(train_dataset) >= args.batch_size_stage1),
-    )
-
-    for epoch in range(1, args.stage1_epochs + 1):
-        t0 = time.time()
-        patch_size = args.patch_size or get_progressive_patch_size(epoch - 1, args.stage1_epochs, min_size=128, max_size=256)
-        train_dataset.set_patch_size(patch_size)
-
-        loss = train_one_epoch(model, train_loader_s1, criterion_s1, optimizer_s1, device, bf16=args.bf16, fp16=args.fp16, scaler=scaler)
-        scheduler_s1.step()
-
-        should_eval = (epoch % args.eval_interval == 0) or (epoch == args.stage1_epochs)
-        if should_eval:
-            val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16)
-            is_best = val_psnr > best_psnr
-            if is_best:
-                best_psnr = val_psnr
-            val_str = f"Val PSNR: {val_psnr:.2f} dB | Val SSIM: {val_ssim:.4f} {'*BEST*' if is_best else ''}"
+    if args.pretrained:
+        if os.path.exists(args.pretrained):
+            ckpt_info = load_pretrained_weights(model, args.pretrained, device=device)
+            best_psnr = ckpt_info.get("best_psnr", -float("inf"))
+            print(f"Loaded pre-trained weights from {args.pretrained}")
         else:
-            is_best = False
-            val_str = "Val: (skipped)"
+            print(f"Warning: Pre-trained file {args.pretrained} not found, initializing from scratch.")
 
-        save_checkpoint(
-            {
-                "epoch": epoch,
-                "stage": 1,
-                "state_dict": model.state_dict(),
-                "best_psnr": best_psnr,
-                "optimizer": optimizer_s1.state_dict(),
-            },
-            is_best=is_best,
-            save_dir=args.checkpoint_dir,
-            filename="stage1_last.pth",
+    if args.freeze_stem:
+        for p in model.stem.parameters():
+            p.requires_grad = False
+        print("Stem parameters frozen.")
+
+    if args.finetune:
+        base_psnr, base_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16)
+        print(f"\nPre-trained Baseline -> Val PSNR: {base_psnr:.2f} dB | Val SSIM: {base_ssim:.4f}")
+        if base_psnr > best_psnr:
+            best_psnr = base_psnr
+    else:
+        # Stage 1: Coarse Training with Progressive Patch Sizes
+        print(f"\nStage 1: {args.stage1_epochs} epochs | Batch Size: {args.batch_size_stage1}")
+        optimizer_s1 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
+        scheduler_s1 = CosineAnnealingLR(optimizer_s1, T_max=args.stage1_epochs, eta_min=1e-6)
+        criterion_s1 = Stage1Loss(eps=1e-3, lambda_grad=0.05).to(device)
+
+        train_loader_s1 = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size_stage1,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=(args.num_workers > 0),
+            drop_last=(len(train_dataset) >= args.batch_size_stage1),
         )
 
-        elapsed = time.time() - t0
-        lr_curr = optimizer_s1.param_groups[0]["lr"]
-        print(
-            f"Stage 1 [Epoch {epoch:03d}/{args.stage1_epochs:03d}] Patch: {patch_size:03d}x{patch_size:03d} | "
-            f"LR: {lr_curr:.6f} | Loss: {loss:.4f} | {val_str} [{elapsed:.1f}s]"
-        )
+        for epoch in range(1, args.stage1_epochs + 1):
+            t0 = time.time()
+            patch_size = args.patch_size or get_progressive_patch_size(epoch - 1, args.stage1_epochs, min_size=128, max_size=256)
+            train_dataset.set_patch_size(patch_size)
 
-    del optimizer_s1, scheduler_s1, criterion_s1, train_loader_s1
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    elif device.type == "xla":
-        import torch_xla.core.xla_model as xm
-        xm.mark_step()
+            loss = train_one_epoch(model, train_loader_s1, criterion_s1, optimizer_s1, device, bf16=args.bf16, fp16=args.fp16, scaler=scaler)
+            scheduler_s1.step()
 
-    best_ckpt = os.path.join(args.checkpoint_dir, "best_model.pth")
-    if os.path.exists(best_ckpt):
-        ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["state_dict"])
-        best_psnr = ckpt.get("best_psnr", best_psnr)
+            should_eval = (epoch % args.eval_interval == 0) or (epoch == args.stage1_epochs)
+            if should_eval:
+                val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16)
+                is_best = val_psnr > best_psnr
+                if is_best:
+                    best_psnr = val_psnr
+                val_str = f"Val PSNR: {val_psnr:.2f} dB | Val SSIM: {val_ssim:.4f} {'*BEST*' if is_best else ''}"
+            else:
+                is_best = False
+                val_str = "Val: (skipped)"
 
-    # Stage 2: Fine-Tuning with 256x256 Patches
-    print(f"\nStage 2: {args.stage2_epochs} epochs | Batch Size: {args.batch_size_stage2}")
+            save_checkpoint(
+                {
+                    "epoch": epoch,
+                    "stage": 1,
+                    "state_dict": model.state_dict(),
+                    "best_psnr": best_psnr,
+                    "optimizer": optimizer_s1.state_dict(),
+                },
+                is_best=is_best,
+                save_dir=args.checkpoint_dir,
+                filename="stage1_last.pth",
+            )
+
+            elapsed = time.time() - t0
+            lr_curr = optimizer_s1.param_groups[0]["lr"]
+            print(
+                f"Stage 1 [Epoch {epoch:03d}/{args.stage1_epochs:03d}] Patch: {patch_size:03d}x{patch_size:03d} | "
+                f"LR: {lr_curr:.6f} | Loss: {loss:.4f} | {val_str} [{elapsed:.1f}s]"
+            )
+
+        del optimizer_s1, scheduler_s1, criterion_s1, train_loader_s1
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif device.type == "xla":
+            import torch_xla.core.xla_model as xm
+            xm.mark_step()
+
+        best_ckpt = os.path.join(args.checkpoint_dir, "best_model.pth")
+        if os.path.exists(best_ckpt):
+            ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["state_dict"])
+            best_psnr = ckpt.get("best_psnr", best_psnr)
+
+    # Stage 2 / Fine-Tuning
+    s2_epochs = args.finetune_epochs if args.finetune else args.stage2_epochs
+    s2_lr = args.finetune_lr if args.finetune else 1e-4
+    stage_label = "Fine-Tuning" if args.finetune else "Stage 2"
+    last_ckpt_name = "finetuned_last.pth" if args.finetune else "stage2_last.pth"
+
+    print(f"\n{stage_label}: {s2_epochs} epochs | Batch Size: {args.batch_size_stage2} | LR: {s2_lr}")
     train_dataset.set_patch_size(256)
     train_loader_s2 = DataLoader(
         train_dataset,
@@ -299,16 +327,16 @@ def run_pipeline(args):
         drop_last=(len(train_dataset) >= args.batch_size_stage2),
     )
 
-    optimizer_s2 = AdamW(model.parameters(), lr=1e-4, betas=(0.9, 0.999), weight_decay=1e-4)
-    scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=args.stage2_epochs, eta_min=1e-6)
+    optimizer_s2 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=s2_lr, betas=(0.9, 0.999), weight_decay=1e-4)
+    scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
     criterion_s2 = Stage2SharpLoss(data_range=1.0, eps=1e-6).to(device)
 
-    for epoch in range(1, args.stage2_epochs + 1):
+    for epoch in range(1, s2_epochs + 1):
         t0 = time.time()
         loss = train_one_epoch(model, train_loader_s2, criterion_s2, optimizer_s2, device, bf16=args.bf16, fp16=args.fp16, scaler=scaler)
         scheduler_s2.step()
 
-        should_eval = (epoch % args.eval_interval == 0) or (epoch == args.stage2_epochs)
+        should_eval = (epoch % args.eval_interval == 0) or (epoch == s2_epochs)
         if should_eval:
             val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16)
             is_best = val_psnr > best_psnr
@@ -322,20 +350,20 @@ def run_pipeline(args):
         save_checkpoint(
             {
                 "epoch": epoch,
-                "stage": 2,
+                "stage": 2 if not args.finetune else "finetune",
                 "state_dict": model.state_dict(),
                 "best_psnr": best_psnr,
                 "optimizer": optimizer_s2.state_dict(),
             },
             is_best=is_best,
             save_dir=args.checkpoint_dir,
-            filename="stage2_last.pth",
+            filename=last_ckpt_name,
         )
 
         elapsed = time.time() - t0
         lr_curr = optimizer_s2.param_groups[0]["lr"]
         print(
-            f"Stage 2 [Epoch {epoch:02d}/{args.stage2_epochs:02d}] Patch: 256x256 | "
+            f"{stage_label} [Epoch {epoch:02d}/{s2_epochs:02d}] Patch: 256x256 | "
             f"LR: {lr_curr:.6f} | PSNR Loss: {loss:.4f} | {val_str} [{elapsed:.1f}s]"
         )
 
@@ -388,6 +416,11 @@ def main():
     parser.add_argument("--bf16", action="store_true", help="Enable BF16 mixed precision training")
     parser.add_argument("--fp16", action="store_true", help="Enable FP16 mixed precision training")
     parser.add_argument("--patch-size", type=int, default=None, help="Fixed patch size for Stage 1 (disables progressive resizing if set)")
+    parser.add_argument("--pretrained", type=str, default=None, help="Path to pre-trained checkpoint to load/fine-tune")
+    parser.add_argument("--finetune", action="store_true", help="Fine-tune pre-trained model (skips Stage 1 coarse training)")
+    parser.add_argument("--finetune-epochs", type=int, default=30, help="Epochs for fine-tuning")
+    parser.add_argument("--finetune-lr", type=float, default=5e-5, help="Learning rate for fine-tuning")
+    parser.add_argument("--freeze-stem", action="store_true", help="Freeze stem layer during fine-tuning")
     parser.add_argument("--dry-run", action="store_true", help="Run 1-epoch dry run")
 
     args = parser.parse_args()
@@ -395,6 +428,7 @@ def main():
     if args.dry_run:
         args.stage1_epochs = 1
         args.stage2_epochs = 1
+        args.finetune_epochs = 1
         args.batch_size_stage1 = 4
         args.batch_size_stage2 = 2
         args.synthetic_samples = 8

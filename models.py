@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Optional, Tuple
 
 
 def haar_dwt(x: torch.Tensor) -> torch.Tensor:
@@ -325,6 +326,61 @@ def test_reparameterization_equivalence(device: str = "cpu", tol: float = 1e-5) 
 
     assert max_diff < tol, f"Equivalence test failed: max diff = {max_diff:.8e} >= {tol}"
     return max_diff
+
+
+def load_pretrained_weights(model: nn.Module, checkpoint_path: str, device: Optional[torch.device] = None) -> dict:
+    ckpt = torch.load(checkpoint_path, map_location=device or "cpu", weights_only=False)
+    state = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+
+    if isinstance(ckpt, dict) and ckpt.get("quantized_format") == "symmetric_int8_per_channel":
+        dequant = {}
+        for k, v in state.items():
+            if k.endswith("_scale"):
+                continue
+            dequant[k] = v.float() * state[f"{k}_scale"] if f"{k}_scale" in state else v
+        state = dequant
+
+    if any(".conv_deploy." in k for k in state.keys()):
+        train_state = model.state_dict()
+        for k, v in state.items():
+            if "stem.conv_deploy" in k or "head.conv_deploy" in k:
+                prefix, attr = k.rsplit(".conv_deploy.", 1)
+                if attr == "bias":
+                    train_state[f"{prefix}.conv3x3.bias"] = v.clone()
+                    train_state[f"{prefix}.conv1x1.bias"] = torch.zeros_like(train_state[f"{prefix}.conv1x1.bias"])
+                elif attr == "weight":
+                    w = v.clone()
+                    in_ch, out_ch = w.shape[1], w.shape[0]
+                    if in_ch == out_ch:
+                        pad_size = 3 // 2
+                        w_id = torch.zeros_like(w)
+                        for i in range(in_ch):
+                            w_id[i, i, pad_size, pad_size] = 1.0
+                        w = w - w_id
+                    train_state[f"{prefix}.conv3x3.weight"] = w
+                    train_state[f"{prefix}.conv1x1.weight"] = torch.zeros_like(train_state[f"{prefix}.conv1x1.weight"])
+            elif ".conv_deploy." in k:
+                prefix, attr = k.rsplit(".conv_deploy.", 1)
+                if attr == "bias":
+                    train_state[f"{prefix}.conv_normal.bias"] = v.clone()
+                    train_state[f"{prefix}.conv_expand.bias"] = torch.zeros_like(train_state[f"{prefix}.conv_expand.bias"])
+                    train_state[f"{prefix}.conv_squeeze.bias"] = torch.zeros_like(train_state[f"{prefix}.conv_squeeze.bias"])
+                    train_state[f"{prefix}.bias_dx"] = torch.zeros_like(train_state[f"{prefix}.bias_dx"])
+                    train_state[f"{prefix}.bias_dy"] = torch.zeros_like(train_state[f"{prefix}.bias_dy"])
+                    train_state[f"{prefix}.bias_lap"] = torch.zeros_like(train_state[f"{prefix}.bias_lap"])
+                elif attr == "weight":
+                    train_state[f"{prefix}.conv_normal.weight"] = v.clone()
+                    train_state[f"{prefix}.conv_expand.weight"] = torch.zeros_like(train_state[f"{prefix}.conv_expand.weight"])
+                    train_state[f"{prefix}.conv_squeeze.weight"] = torch.zeros_like(train_state[f"{prefix}.conv_squeeze.weight"])
+                    train_state[f"{prefix}.scale_dx"] = torch.zeros_like(train_state[f"{prefix}.scale_dx"])
+                    train_state[f"{prefix}.scale_dy"] = torch.zeros_like(train_state[f"{prefix}.scale_dy"])
+                    train_state[f"{prefix}.scale_lap"] = torch.zeros_like(train_state[f"{prefix}.scale_lap"])
+            elif k in train_state:
+                train_state[k] = v.clone()
+        state = train_state
+
+    model.load_state_dict(state, strict=False)
+    return ckpt if isinstance(ckpt, dict) else {"state_dict": ckpt}
 
 
 if __name__ == "__main__":
