@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 
 def haar_dwt(x: torch.Tensor) -> torch.Tensor:
@@ -309,12 +309,13 @@ class RepAFDenoiseNet(nn.Module):
         return y - n_hat
 
 
-def test_reparameterization_equivalence(device: str = "cpu", tol: float = 1e-5) -> float:
+def test_reparameterization_equivalence(device: Union[str, torch.device] = "cpu", tol: float = 1e-5) -> float:
     """Unit test checking that the numerical difference between training-mode output
     and fused inference-mode output is negligible (max absolute error < 1e-5).
     """
-    model = RepAFDenoiseNet().to(device)
-    x = torch.randn(2, 3, 64, 64, device=device)
+    dev = torch.device(device) if isinstance(device, str) else device
+    model = RepAFDenoiseNet().to(dev)
+    x = torch.randn(2, 3, 64, 64, device=dev)
 
     with torch.no_grad():
         model.train()
@@ -384,7 +385,8 @@ def load_pretrained_weights(model: nn.Module, checkpoint_path: str, device: Opti
 
 
 if __name__ == "__main__":
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Running RepAF-Denoise Net reparameterization unit test on {dev}...")
+    from devices import get_device, get_device_name
+    dev = get_device("auto")
+    print(f"Running RepAF-Denoise Net reparameterization unit test on {dev} ({get_device_name(dev)})...")
     err = test_reparameterization_equivalence(device=dev)
     print(f"PASSED! Max absolute error: {err:.8e} (threshold: 1e-5)")

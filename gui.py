@@ -170,12 +170,13 @@ class TrainingWorker(QThread):
             from torch.optim import AdamW
             from torch.optim.lr_scheduler import CosineAnnealingLR
             from torch.utils.data import DataLoader
+            from devices import clear_device_cache, create_grad_scaler, get_amp_context, get_device, get_device_name
             from losses import Stage1Loss, PSNRLoss, Stage2SharpLoss
             from metrics import calculate_psnr, calculate_ssim
-            from train import get_device, get_progressive_patch_size
+            from train import get_progressive_patch_size
 
-            device = get_device()
-            self.log_signal.emit(f"Initializing RepAF-Denoise Net on {device}...")
+            device = get_device(self.config.get("device", "auto"))
+            self.log_signal.emit(f"Initializing RepAF-Denoise Net on {device} ({get_device_name(device)})...")
             model = RepAFDenoiseNet(c=40).to(device)
 
             num_workers = self.config.get("num_workers", 0)
@@ -205,7 +206,7 @@ class TrainingWorker(QThread):
                 val_dataset,
                 batch_size=16,
                 shuffle=False,
-                pin_memory=(device.type == "cuda"),
+                pin_memory=(device.type in ("cuda", "xpu")),
             )
 
             best_psnr = -float("inf")
@@ -214,8 +215,8 @@ class TrainingWorker(QThread):
             bf16 = self.config.get("bf16", False)
             fp16 = self.config.get("fp16", False)
             amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32)
-            amp_enabled = (fp16 or bf16) and device.type == "cuda"
-            scaler = torch.amp.GradScaler("cuda", enabled=(fp16 and device.type == "cuda"))
+            amp_enabled = (fp16 or bf16) and device.type in ("cuda", "xpu", "cpu")
+            scaler = create_grad_scaler(device, enabled=(fp16 and device.type in ("cuda", "xpu")))
 
             is_finetune = self.config.get("is_finetune", False)
             pretrained_path = self.config.get("pretrained_path")
@@ -238,7 +239,7 @@ class TrainingWorker(QThread):
                 with torch.inference_mode():
                     for noisy, clean in val_loader:
                         noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                        with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                             pred = torch.clamp(model(noisy), 0.0, 1.0)
                         bs = noisy.size(0)
                         total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
@@ -262,7 +263,7 @@ class TrainingWorker(QThread):
                     batch_size=self.config["batch_size_stage1"],
                     shuffle=True,
                     num_workers=num_workers,
-                    pin_memory=(device.type == "cuda"),
+                    pin_memory=(device.type in ("cuda", "xpu")),
                     persistent_workers=(num_workers > 0),
                     drop_last=(len(train_dataset) >= self.config["batch_size_stage1"]),
                 )
@@ -284,7 +285,7 @@ class TrainingWorker(QThread):
                             break
                         noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                         optimizer_s1.zero_grad(set_to_none=True)
-                        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                        with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                             loss = criterion_s1(model(noisy), clean)
                         if not torch.isfinite(loss) or loss.abs().item() > 100.0:
                             continue
@@ -331,7 +332,7 @@ class TrainingWorker(QThread):
                                     self.finished.emit("Cancelled")
                                     return
                                 noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                                with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                                     pred = torch.clamp(model(noisy), 0.0, 1.0)
                                 if not torch.isfinite(pred).all():
                                     continue
@@ -360,8 +361,7 @@ class TrainingWorker(QThread):
                     )
 
                 del optimizer_s1, scheduler_s1, criterion_s1, loader_s1
-                if device.type == "cuda":
-                    torch.cuda.empty_cache()
+                clear_device_cache(device)
 
                 best_ckpt = os.path.join(save_dir, "best_model.pth")
                 if os.path.exists(best_ckpt):
@@ -382,7 +382,7 @@ class TrainingWorker(QThread):
                 batch_size=self.config["batch_size_stage2"],
                 shuffle=True,
                 num_workers=num_workers,
-                pin_memory=(device.type == "cuda"),
+                pin_memory=(device.type in ("cuda", "xpu")),
                 persistent_workers=(num_workers > 0),
                 drop_last=(len(train_dataset) >= self.config["batch_size_stage2"]),
             )
@@ -404,7 +404,7 @@ class TrainingWorker(QThread):
                         break
                     noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
                     optimizer_s2.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                    with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                         loss = criterion_s2(model(noisy), clean)
                     if not torch.isfinite(loss) or loss.abs().item() > 100.0:
                         continue
@@ -451,7 +451,7 @@ class TrainingWorker(QThread):
                                 self.finished.emit("Cancelled")
                                 return
                             noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+                            with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                                 pred = torch.clamp(model(noisy), 0.0, 1.0)
                             if not torch.isfinite(pred).all():
                                 continue
@@ -507,11 +507,7 @@ class TrainingWorker(QThread):
         finally:
             from dataset import clear_image_cache
             clear_image_cache()
-            import gc
-            if "device" in locals() and device.type == "cuda":
-                import torch
-                torch.cuda.empty_cache()
-            gc.collect()
+            clear_device_cache(device if "device" in locals() else None)
 
 
 # -----------------------------------------------------------------------------
@@ -579,7 +575,7 @@ class RepAFDenoiseGUI(QMainWindow):
         self.btn_refresh_models.clicked.connect(self._refresh_models)
 
         self.combo_device = QComboBox()
-        self.combo_device.addItems(["Auto", "GPU", "CPU"])
+        self.combo_device.addItems(["Auto", "CUDA / ROCm", "Intel XPU", "CPU"])
 
         self.chk_tiled = QCheckBox("Tiled Mode")
         self.combo_tile_size = QComboBox()
@@ -807,8 +803,13 @@ class RepAFDenoiseGUI(QMainWindow):
         grid.addWidget(self.chk_fp16, 4, 0)
         grid.addWidget(self.chk_bf16, 4, 1)
 
+        self.combo_train_device = QComboBox()
+        self.combo_train_device.addItems(["Auto", "CUDA / ROCm", "Intel XPU", "CPU"])
+        grid.addWidget(QLabel("Device:"), 5, 0)
+        grid.addWidget(self.combo_train_device, 5, 1)
+
         self.chk_shutdown = QCheckBox("Shutdown PC after training")
-        grid.addWidget(self.chk_shutdown, 4, 2, 1, 2)
+        grid.addWidget(self.chk_shutdown, 5, 2, 1, 2)
 
         layout.addWidget(cfg_box)
 
@@ -1055,8 +1056,8 @@ class RepAFDenoiseGUI(QMainWindow):
         tiled = self.chk_tiled.isChecked()
         tile_size = int(self.combo_tile_size.currentText())
 
-        dev_choice = self.combo_device.currentText().lower()
-        device = dev_choice if dev_choice in ["gpu", "cpu"] else "auto"
+        dev_map = {"auto": "auto", "cuda / rocm": "cuda", "intel xpu": "xpu", "gpu": "auto", "cpu": "cpu"}
+        device = dev_map.get(self.combo_device.currentText().strip().lower(), "auto")
 
         self.btn_run_denoise.setEnabled(False)
         self.status_label.setText(f"Running inference on {self.noisy_image.size[0]}x{self.noisy_image.size[1]} image...")
@@ -1149,7 +1150,11 @@ class RepAFDenoiseGUI(QMainWindow):
             QMessageBox.warning(self, "Invalid Checkpoint", "Please select a valid pre-trained .pth checkpoint to fine-tune.")
             return
 
+        dev_map = {"auto": "auto", "cuda / rocm": "cuda", "intel xpu": "xpu", "gpu": "auto", "cpu": "cpu"}
+        train_dev = dev_map.get(self.combo_train_device.currentText().strip().lower(), "auto")
+
         config = {
+            "device": train_dev,
             "is_finetune": is_finetune,
             "pretrained_path": pretrained_path,
             "finetune_epochs": self.spin_ft_epochs.value(),

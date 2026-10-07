@@ -7,6 +7,7 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
+from devices import clear_device_cache, get_device
 from models import RepAFDenoiseNet
 
 _TORCH_MODEL_CACHE: Dict[Tuple[str, str, float], RepAFDenoiseNet] = {}
@@ -21,8 +22,7 @@ def clear_inference_cache():
     _ONNX_SESSION_CACHE.clear()
     _HANN_WINDOW_CACHE.clear()
     _NP_HANN_CACHE.clear()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    clear_device_cache()
 
 
 def load_pytorch_model(model_path: str, device: torch.device) -> RepAFDenoiseNet:
@@ -65,12 +65,8 @@ def get_hann_window_torch(
     key = (tile_size, width, str(device), dtype, h_tiled, w_tiled)
     mask = _HANN_WINDOW_CACHE.get(key)
     if mask is None:
-        if getattr(device, "type", None) == "xla":
-            w_y = torch.hann_window(tile_size, dtype=dtype).to(device).view(tile_size, 1) if h_tiled else torch.ones(tile_size, 1, device=device, dtype=dtype)
-            w_x = torch.hann_window(width, dtype=dtype).to(device).view(1, width) if w_tiled else torch.ones(1, width, device=device, dtype=dtype)
-        else:
-            w_y = torch.hann_window(tile_size, device=device, dtype=dtype).view(tile_size, 1) if h_tiled else torch.ones(tile_size, 1, device=device, dtype=dtype)
-            w_x = torch.hann_window(width, device=device, dtype=dtype).view(1, width) if w_tiled else torch.ones(1, width, device=device, dtype=dtype)
+        w_y = torch.hann_window(tile_size, dtype=dtype).to(device).view(tile_size, 1) if h_tiled else torch.ones(tile_size, 1, device=device, dtype=dtype)
+        w_x = torch.hann_window(width, dtype=dtype).to(device).view(1, width) if w_tiled else torch.ones(1, width, device=device, dtype=dtype)
         mask = torch.clamp((w_y * w_x).view(1, 1, tile_size, width), min=1e-4)
         _HANN_WINDOW_CACHE[key] = mask
     return mask
@@ -208,11 +204,11 @@ def run_denoise(
         session = _ONNX_SESSION_CACHE.get(cache_key)
         if session is None:
             available = ort.get_available_providers()
-            providers = ["CPUExecutionProvider"] if device == "cpu" else (
-                ["DmlExecutionProvider", "CPUExecutionProvider"]
-                if "DmlExecutionProvider" in available
-                else ["CPUExecutionProvider"]
-            )
+            if device == "cpu":
+                providers = ["CPUExecutionProvider"]
+            else:
+                gpu_providers = [p for p in ["ROCMExecutionProvider", "CUDAExecutionProvider", "DmlExecutionProvider", "OpenVINOExecutionProvider"] if p in available]
+                providers = gpu_providers + (["CPUExecutionProvider"] if "CPUExecutionProvider" not in gpu_providers else [])
             session = ort.InferenceSession(model_path, providers=providers)
             _ONNX_SESSION_CACHE[cache_key] = session
 
@@ -240,21 +236,7 @@ def run_denoise(
         denoised_img = Image.fromarray(out_arr)
 
     else:
-        if isinstance(device, torch.device):
-            dev = device
-        elif device == "cpu":
-            dev = torch.device("cpu")
-        elif "xla" in str(device):
-            try:
-                import torch_xla.core.xla_model as xm
-                dev = xm.xla_device()
-            except Exception:
-                dev = torch.device("cpu")
-        elif device == "cuda" or (device != "cpu" and torch.cuda.is_available()):
-            dev = torch.device("cuda")
-        else:
-            dev = torch.device("cpu")
-
+        dev = get_device(device)
         model = load_pytorch_model(model_path, dev)
 
         # Transfer uint8 to GPU/TPU, then float/div on device for reduced host bandwidth
@@ -277,14 +259,7 @@ def run_denoise(
         out_uint8 = out[0].mul(255.0).add_(0.5).clamp_(0, 255).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
         denoised_img = Image.fromarray(out_uint8)
         del x, out
-        if dev.type == "cuda":
-            torch.cuda.empty_cache()
-        elif dev.type == "xla":
-            try:
-                import torch_xla.core.xla_model as xm
-                xm.mark_step()
-            except Exception:
-                pass
+        clear_device_cache(dev)
 
     if has_alpha and alpha_channel is not None:
         denoised_img = Image.merge("RGBA", (*denoised_img.split(), alpha_channel))

@@ -10,25 +10,15 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from dataset import DenoisingDataset
+from devices import clear_device_cache, create_grad_scaler, get_amp_context, get_device as resolve_device, get_device_name
 from export import export_int8_quantization, export_onnx
 from losses import PSNRLoss, Stage1Loss, Stage2SharpLoss
 from metrics import calculate_psnr, calculate_ssim
 from models import RepAFDenoiseNet, load_pretrained_weights, test_reparameterization_equivalence
 
 
-def get_device() -> torch.device:
-    try:
-        import torch_xla.core.xla_model as xm
-        return xm.xla_device()
-    except Exception:
-        pass
-    if torch.cuda.is_available():
-        try:
-            _ = torch.zeros(1, device="cuda")
-            return torch.device("cuda")
-        except Exception as e:
-            print(f"CUDA initialization failed ({e}), falling back to CPU.")
-    return torch.device("cpu")
+def get_device(hint: str = "auto") -> torch.device:
+    return resolve_device(hint)
 
 
 def get_progressive_patch_size(epoch: int, total_epochs: int, min_size: int = 128, max_size: int = 256) -> int:
@@ -54,7 +44,7 @@ def train_one_epoch(
     valid_count = 0
     is_xla = (device.type == "xla")
     amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32)
-    amp_enabled = (fp16 or bf16) and device.type == "cuda"
+    amp_enabled = (fp16 or bf16) and device.type in ("cuda", "xpu", "cpu")
 
     device_loader = loader
     if is_xla:
@@ -70,7 +60,7 @@ def train_one_epoch(
             clean = clean.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+        with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
             pred = model(noisy)
             loss = criterion(pred, clean)
         if not torch.isfinite(loss) or loss.abs().item() > 100.0:
@@ -118,7 +108,7 @@ def evaluate(
     count = 0
     is_xla = (device.type == "xla")
     amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32)
-    amp_enabled = (fp16 or bf16) and device.type == "cuda"
+    amp_enabled = (fp16 or bf16) and device.type in ("cuda", "xpu", "cpu")
 
     eval_loader = loader
     if is_xla:
@@ -133,7 +123,7 @@ def evaluate(
             noisy = noisy.to(device, non_blocking=True)
             clean = clean.to(device, non_blocking=True)
 
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+        with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
             pred = torch.clamp(model(noisy), 0.0, 1.0)
         if not torch.isfinite(pred).all():
             continue
@@ -179,14 +169,14 @@ def save_checkpoint(
 
 
 def run_pipeline(args):
-    device = get_device()
+    device = get_device(getattr(args, "device", "auto"))
     if device.type == "cuda" and getattr(torch.version, "hip", None) is None:
         torch.backends.cudnn.benchmark = True
-    dev_name = "Cloud TPU v6e-1 (Trillium)" if device.type == "xla" else (torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU")
+    dev_name = get_device_name(device)
     precision_tag = " [FP16]" if args.fp16 else (" [BF16]" if args.bf16 else "")
     print(f"RepAF-Denoise Net Training Pipeline on {device} ({dev_name}){precision_tag}")
 
-    scaler = torch.amp.GradScaler("cuda", enabled=(args.fp16 and device.type == "cuda"))
+    scaler = create_grad_scaler(device, enabled=(args.fp16 and device.type in ("cuda", "xpu")))
     model = RepAFDenoiseNet(c=40).to(device)
 
     train_dataset = DenoisingDataset(
@@ -217,7 +207,7 @@ def run_pipeline(args):
         batch_size=args.batch_size_val,
         shuffle=False,
         num_workers=0,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=(device.type in ("cuda", "xpu")),
     )
 
     best_psnr = -float("inf")
@@ -252,7 +242,7 @@ def run_pipeline(args):
             batch_size=args.batch_size_stage1,
             shuffle=True,
             num_workers=args.num_workers,
-            pin_memory=(device.type == "cuda"),
+            pin_memory=(device.type in ("cuda", "xpu")),
             persistent_workers=(args.num_workers > 0),
             drop_last=(len(train_dataset) >= args.batch_size_stage1),
         )
@@ -297,11 +287,7 @@ def run_pipeline(args):
             )
 
         del optimizer_s1, scheduler_s1, criterion_s1, train_loader_s1
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        elif device.type == "xla":
-            import torch_xla.core.xla_model as xm
-            xm.mark_step()
+        clear_device_cache(device)
 
         best_ckpt = os.path.join(args.checkpoint_dir, "best_model.pth")
         if os.path.exists(best_ckpt):
@@ -322,7 +308,7 @@ def run_pipeline(args):
         batch_size=args.batch_size_stage2,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=(device.type in ("cuda", "xpu")),
         persistent_workers=(args.num_workers > 0),
         drop_last=(len(train_dataset) >= args.batch_size_stage2),
     )
@@ -391,13 +377,13 @@ def run_pipeline(args):
 
     from dataset import clear_image_cache
     clear_image_cache()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+    clear_device_cache(device)
     print("Training and export complete.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="RepAF-Denoise Net Training and Export Pipeline")
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "rocm", "xpu", "mps", "xla", "cpu"], help="Hardware accelerator device")
     parser.add_argument("--train-noisy-dir", type=str, default=None, help="Training noisy images directory")
     parser.add_argument("--train-clean-dir", type=str, default=None, help="Training clean images directory")
     parser.add_argument("--val-noisy-dir", type=str, default=None, help="Validation noisy images directory")

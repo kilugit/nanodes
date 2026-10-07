@@ -46,7 +46,7 @@ pip install -r requirements.txt
 Install the optimized PyTorch and ONNX Runtime backend for your hardware:
 
 - **AMD GPU (Native ROCm on Windows):**
-  Note: (device-gfx1200)=RX 9060XT.
+  Note: (device-gfx1200)=RX 9060XT. For additional setup details, supported GPU targets, and official guides, see the [ROCm Documentation](https://rocm.docs.amd.com/en/latest/).
   ```bash
   python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,device-gfx1200]==10.0.0"
   python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "torch[device-gfx1200]==2.13.0+rocm10.0.0" "torchvision[device-gfx1200]==0.28.0+rocm10.0.0" "torchaudio==2.11.0.2+rocm10.0.0"
@@ -65,6 +65,12 @@ Install the optimized PyTorch and ONNX Runtime backend for your hardware:
 
   # ONNX Runtime with CUDA / TensorRT:
   pip install onnxruntime-gpu
+  ```
+
+- **Intel GPU (XPU):**
+  ```bash
+  # PyTorch with Intel XPU support:
+  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
   ```
 
 - **CPU-Only / Headless Server (No Desktop GUI):**
@@ -103,28 +109,6 @@ python -c "from inference import run_denoise; img, ms = run_denoise('samples/ima
 
 # Run two-stage training
 python train.py --stage1-epochs 100 --stage2-epochs 30 --batch-size-stage1 32 --batch-size-stage2 8
-```
-
----
-
-## 📂 Project Repository Structure
-
-```
-nanodes/
-├── requirements.txt            # Python dependencies specification
-├── models.py                   # RepAFDenoiseNet, RepConv2d, Haar DWT/IWT
-├── inference.py                # Tiled & full inference (PyTorch & ONNX)
-├── export.py                   # ONNX FP32/FP16 & INT8 QDQ exporter
-├── export_gui.py               # PyQt6 Model Export & Quantization GUI
-├── gui.py                      # PyQt6 Main Desktop GUI
-├── train.py                    # Two-stage progressive training pipeline
-├── dataset.py                  # DenoisingDataset & memory-efficient caching
-├── losses.py                   # Stage1Loss (Charbonnier + Sobel) & PSNRLoss
-├── metrics.py                  # Analytical PSNR & SSIM evaluation
-├── process_samples.py          # Synthetic degradation & crop generator
-├── pytorch models/             # Saved PyTorch checkpoints (.pth)
-├── onnx models/                # Exported ONNX graphs (.onnx)
-└── samples/                    # High-resolution sample images
 ```
 
 ---
