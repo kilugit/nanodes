@@ -44,6 +44,27 @@ def create_defocus_kernel(radius: int) -> np.ndarray:
     return kernel / total if total > 0 else np.ones((size, size), dtype=np.float32) / (size * size)
 
 
+def apply_convolution(img: Image.Image, kernel: np.ndarray) -> Image.Image:
+    k_h, k_w = kernel.shape
+    pad_h, pad_w = k_h // 2, k_w // 2
+    try:
+        import torch
+        import torch.nn.functional as F
+
+        arr = np.array(img, dtype=np.float32)
+        t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)
+        k = torch.from_numpy(kernel).float().view(1, 1, k_h, k_w).repeat(t.shape[1], 1, 1, 1)
+        t_pad = F.pad(t, (pad_w, pad_w, pad_h, pad_h), mode="reflect")
+        out = F.conv2d(t_pad, k, groups=t.shape[1]).squeeze(0).permute(1, 2, 0)
+        return Image.fromarray(torch.clamp(out + 0.5, 0, 255).to(torch.uint8).numpy())
+    except ImportError:
+        arr = np.array(img, dtype=np.float32)
+        padded = np.pad(arr, ((pad_h, pad_h), (pad_w, pad_w), (0, 0)), mode="reflect")
+        windows = np.lib.stride_tricks.sliding_window_view(padded, (k_h, k_w), axis=(0, 1))
+        out = np.einsum("hwcij,ij->hwc", windows, kernel)
+        return Image.fromarray(np.clip(out + 0.5, 0, 255).astype(np.uint8))
+
+
 def apply_blur(
     img: Image.Image,
     blur_type: str = "gaussian",
@@ -66,14 +87,11 @@ def apply_blur(
         k_size = max(3, int(round(strength * 2 + 1)) | 1)
         angle = r.uniform(0.0, 360.0)
         kernel = create_motion_blur_kernel(k_size, angle)
-        filt = ImageFilter.Kernel((k_size, k_size), kernel.flatten().tolist(), scale=1.0, offset=0)
-        return img.filter(filt)
+        return apply_convolution(img, kernel)
     elif b_type == "defocus":
         rad = max(1, int(round(strength)))
         kernel = create_defocus_kernel(rad)
-        k_size = rad * 2 + 1
-        filt = ImageFilter.Kernel((k_size, k_size), kernel.flatten().tolist(), scale=1.0, offset=0)
-        return img.filter(filt)
+        return apply_convolution(img, kernel)
     return img
 
 
@@ -161,7 +179,7 @@ def extract_patches(
         for _ in range(8):
             left = r.randint(0, w - patch_size)
             top = r.randint(0, h - patch_size)
-            candidate = img.crop((left, top, left + patch_size, top + patch_size))
+            candidate = composite_rgba_to_rgb(img.crop((left, top, left + patch_size, top + patch_size)))
             std_val = float(np.std(np.array(candidate, dtype=np.float32)))
             if std_val > 5.0:
                 best_left, best_top, best_patch = left, top, candidate
@@ -171,7 +189,7 @@ def extract_patches(
                 best_left, best_top, best_patch = left, top, candidate
 
         if best_patch is None:
-            best_patch = img.crop((best_left, best_top, best_left + patch_size, best_top + patch_size))
+            best_patch = composite_rgba_to_rgb(img.crop((best_left, best_top, best_left + patch_size, best_top + patch_size)))
 
         patches.append(((best_left, best_top), best_patch))
 
@@ -252,24 +270,22 @@ def process_sample_image(
 
     try:
         with Image.open(image_path) as raw_img:
-            img = composite_rgba_to_rgb(raw_img)
+            if raw_img.width < patch_size or raw_img.height < patch_size:
+                print(f"Warning: Skipping {image_path}: size {raw_img.size} is smaller than patch size {patch_size}x{patch_size}")
+                return []
+            py_rng = random.Random(seed)
+            patches = extract_patches(raw_img, patch_size=patch_size, num_crops=num_crops, rng=py_rng)
     except Exception as e:
         print(f"Warning: Failed to open image {image_path}: {e}")
         return []
 
-    if img.width < patch_size or img.height < patch_size:
-        print(f"Warning: Skipping {image_path}: size {img.size} is smaller than patch size {patch_size}x{patch_size}")
+    if not patches:
         return []
 
     os.makedirs(output_clean_dir, exist_ok=True)
     os.makedirs(output_noisy_dir, exist_ok=True)
 
     base_name = os.path.splitext(os.path.basename(image_path))[0]
-    py_rng = random.Random(seed)
-
-    patches = extract_patches(img, patch_size=patch_size, num_crops=num_crops, rng=py_rng)
-    if not patches:
-        return []
 
     if num_random_versions > 0:
         actual_versions = num_random_versions
@@ -429,7 +445,7 @@ def process_all_samples(
     num_versions = num_random_versions if num_random_versions > 0 else (len(jpeg_qualities) if jpeg_qualities else 1)
     expected_samples = len(image_paths) * num_crops * num_versions
 
-    workers = max_workers or min(8, os.cpu_count() or 4)
+    workers = max_workers or min(4, os.cpu_count() or 2)
     total_pairs = 0
     lock = threading.Lock()
 
@@ -438,7 +454,10 @@ def process_all_samples(
         with lock:
             total_pairs += count
             if progress_callback:
-                progress_callback(total_pairs)
+                try:
+                    progress_callback(total_pairs, expected_samples)
+                except TypeError:
+                    progress_callback(total_pairs)
 
     tasks = []
     for split_name, paths in split_map.items():

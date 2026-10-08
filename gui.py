@@ -100,7 +100,7 @@ class InferenceWorker(QThread):
 
 
 class DataGenWorker(QThread):
-    progress = pyqtSignal(int)
+    progress = pyqtSignal(int, int)
     log_signal = pyqtSignal(str)
     finished = pyqtSignal(int)
 
@@ -116,6 +116,7 @@ class DataGenWorker(QThread):
         p_blur: float = 0.5,
         blur_type: str = "random",
         blur_range: Tuple[float, float] = (0.5, 2.5),
+        max_workers: Optional[int] = None,
     ):
         super().__init__()
         self.samples_dir = samples_dir
@@ -128,6 +129,7 @@ class DataGenWorker(QThread):
         self.p_blur = p_blur
         self.blur_type = blur_type
         self.blur_range = blur_range
+        self.max_workers = max_workers
 
     def run(self):
         try:
@@ -143,7 +145,8 @@ class DataGenWorker(QThread):
                 p_blur=self.p_blur,
                 blur_type=self.blur_type,
                 blur_range=self.blur_range,
-                progress_callback=lambda c: self.progress.emit(c),
+                max_workers=self.max_workers,
+                progress_callback=lambda curr, total: self.progress.emit(curr, total),
             )
             self.finished.emit(count)
         except Exception as e:
@@ -921,10 +924,15 @@ class RepAFDenoiseGUI(QMainWindow):
         blur_layout.addWidget(self.spin_blur_max)
         blur_layout.addStretch()
 
+        self.spin_datagen_workers = QSpinBox()
+        self.spin_datagen_workers.setRange(1, 16)
+        self.spin_datagen_workers.setValue(min(4, os.cpu_count() or 2))
+
         form.addRow("Crops per Image:", self.spin_crops)
         form.addRow("JPEG Quality Levels:", self.edit_qualities)
         form.addRow("Random Quality Mode:", random_layout)
         form.addRow("Blurring Degradation:", blur_layout)
+        form.addRow("Worker Threads:", self.spin_datagen_workers)
         v.addLayout(form)
 
         self.btn_run_datagen = QPushButton("Generate Training Pairs")
@@ -937,6 +945,7 @@ class RepAFDenoiseGUI(QMainWindow):
 
         self.datagen_log = QTextEdit()
         self.datagen_log.setReadOnly(True)
+        self.datagen_log.document().setMaximumBlockCount(500)
         self.datagen_log.setStyleSheet("background-color: #121212; color: #ffb74d; font-family: Consolas, monospace;")
         v.addWidget(self.datagen_log)
 
@@ -1265,15 +1274,24 @@ class RepAFDenoiseGUI(QMainWindow):
             p_blur=p_blur,
             blur_type=blur_type,
             blur_range=blur_range,
+            max_workers=self.spin_datagen_workers.value(),
         )
         self.datagen_worker.log_signal.connect(lambda msg: self.datagen_log.append(msg))
-        self.datagen_worker.progress.connect(lambda c: self.datagen_log.append(f"Generated pair #{c}"))
+
+        def on_progress(curr, total):
+            if total > 0:
+                self.datagen_progress.setRange(0, total)
+                self.datagen_progress.setValue(curr)
+            if curr % 50 == 0 or curr == total or curr == 1:
+                self.datagen_log.append(f"Generated pair #{curr}/{total}")
+
+        self.datagen_worker.progress.connect(on_progress)
         self.datagen_worker.finished.connect(self._on_datagen_finished)
         self.datagen_worker.start()
 
     def _on_datagen_finished(self, total: int):
         self.btn_run_datagen.setEnabled(True)
-        self.datagen_progress.setValue(100)
+        self.datagen_progress.setValue(self.datagen_progress.maximum() or 100)
         self.datagen_log.append(f"\nProcessing complete! {total} clean-noisy training pairs generated.")
         QMessageBox.information(self, "Data Generation Complete", f"Successfully generated {total} paired training samples!")
 
