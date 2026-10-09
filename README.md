@@ -73,7 +73,7 @@ Install the optimized PyTorch and ONNX Runtime backend for your hardware:
   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
   ```
 
-- **CPU-Only / Headless Server (No Desktop GUI):**
+- **CPU-Only:**
   ```bash
   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
   pip install onnx onnxruntime pillow numpy matplotlib
