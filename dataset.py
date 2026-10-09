@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import glob
 import os
 import random
@@ -11,7 +12,9 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
-def paired_augment(noisy: torch.Tensor, clean: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def paired_augment(
+    noisy: torch.Tensor, clean: torch.Tensor, advanced: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if random.random() > 0.5:
         noisy = torch.flip(noisy, dims=[-1])
         clean = torch.flip(clean, dims=[-1])
@@ -24,6 +27,20 @@ def paired_augment(noisy: torch.Tensor, clean: torch.Tensor) -> Tuple[torch.Tens
     if k > 0:
         noisy = torch.rot90(noisy, k, dims=[-2, -1])
         clean = torch.rot90(clean, k, dims=[-2, -1])
+
+    if advanced:
+        if random.random() < 0.25:
+            perm = torch.randperm(3)
+            noisy = noisy[perm]
+            clean = clean[perm]
+        if random.random() < 0.3:
+            scale = random.uniform(0.9, 1.1)
+            if noisy.is_floating_point():
+                noisy = (noisy * scale).clamp(0.0, 1.0)
+                clean = (clean * scale).clamp(0.0, 1.0)
+            else:
+                noisy = (noisy.float() * scale).clamp(0, 255).to(noisy.dtype)
+                clean = (clean.float() * scale).clamp(0, 255).to(clean.dtype)
 
     return noisy, clean
 
@@ -80,12 +97,16 @@ class DenoisingDataset(Dataset):
         num_synthetic_samples: int = 128,
         cache: bool = True,
         preload_to_ram: bool = False,
+        advanced_augment: bool = False,
+        to_float: bool = True,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.is_train = is_train
         self.preload_to_ram = preload_to_ram
         self.cache = cache and not preload_to_ram
+        self.advanced_augment = advanced_augment
+        self.to_float = to_float
         self.cached_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
         self.paired_files: List[Tuple[str, str]] = []
@@ -131,18 +152,24 @@ class DenoisingDataset(Dataset):
         self.num_synthetic_samples = num_synthetic_samples
 
         if self.preload_to_ram and not self.use_synthetic:
-            for np_path, cp in self.paired_files:
+            def _load_pair(paths):
+                np_path, cp = paths
                 try:
                     with Image.open(np_path) as n_img:
                         n_arr = np.array(n_img.convert("RGB"))
                     with Image.open(cp) as c_img:
                         c_arr = np.array(c_img.convert("RGB"))
-                    self.cached_pairs.append((
+                    return (
                         torch.from_numpy(n_arr).permute(2, 0, 1),
                         torch.from_numpy(c_arr).permute(2, 0, 1),
-                    ))
-                except (OSError, FileNotFoundError):
-                    continue
+                    )
+                except Exception:
+                    return None
+
+            workers = min(8, max(2, os.cpu_count() or 4))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = pool.map(_load_pair, self.paired_files)
+                self.cached_pairs = [r for r in results if r is not None]
 
     def set_patch_size(self, patch_size: int):
         self.patch_size = patch_size
@@ -165,7 +192,9 @@ class DenoisingDataset(Dataset):
             if self.patch_size:
                 noisy, clean = paired_crop(noisy, clean, self.patch_size, is_train=self.is_train)
             if self.is_train:
-                noisy, clean = paired_augment(noisy, clean)
+                noisy, clean = paired_augment(noisy, clean, advanced=self.advanced_augment)
+            if not self.to_float:
+                return (noisy * 255.0).clamp(0, 255).to(torch.uint8), (clean * 255.0).clamp(0, 255).to(torch.uint8)
             return noisy, clean
 
         if self.preload_to_ram and self.cached_pairs:
@@ -194,6 +223,8 @@ class DenoisingDataset(Dataset):
         if self.patch_size:
             noisy, clean = paired_crop(noisy, clean, self.patch_size, is_train=self.is_train)
         if self.is_train:
-            noisy, clean = paired_augment(noisy, clean)
+            noisy, clean = paired_augment(noisy, clean, advanced=self.advanced_augment)
 
-        return noisy.float().div_(255.0), clean.float().div_(255.0)
+        if self.to_float:
+            return noisy.float().div_(255.0), clean.float().div_(255.0)
+        return noisy, clean

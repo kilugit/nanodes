@@ -50,16 +50,53 @@ class LaplacianLoss(nn.Module):
         return self.lambda_lap * curv.abs().mean()
 
 
+class FFTLoss(nn.Module):
+    def __init__(self, lambda_fft: float = 0.05):
+        super().__init__()
+        self.lambda_fft = lambda_fft
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_fft = torch.fft.rfft2(pred.float(), norm="ortho")
+        target_fft = torch.fft.rfft2(target.float(), norm="ortho")
+        loss = F.l1_loss(torch.abs(pred_fft), torch.abs(target_fft))
+        return self.lambda_fft * loss.to(pred.dtype)
+
+
+class SSIMLoss(nn.Module):
+    def __init__(self, lambda_ssim: float = 0.05):
+        super().__init__()
+        self.lambda_ssim = lambda_ssim
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        from metrics import calculate_ssim
+        return self.lambda_ssim * (1.0 - calculate_ssim(pred, target, as_tensor=True))
+
+
 class Stage1Loss(nn.Module):
-    def __init__(self, eps: float = 1e-3, lambda_grad: float = 0.05, lambda_lap: float = 0.02, channels: int = 3):
+    def __init__(
+        self,
+        eps: float = 1e-3,
+        lambda_grad: float = 0.05,
+        lambda_lap: float = 0.02,
+        lambda_fft: float = 0.0,
+        lambda_ssim: float = 0.0,
+        channels: int = 3,
+    ):
         super().__init__()
         self.charbonnier = CharbonnierLoss(eps=eps)
         self.gradient = SpatialGradientLoss(lambda_grad=lambda_grad, channels=channels)
         self.laplacian = LaplacianLoss(lambda_lap=lambda_lap, channels=channels)
+        self.fft = FFTLoss(lambda_fft=lambda_fft) if lambda_fft > 0 else None
+        self.ssim = SSIMLoss(lambda_ssim=lambda_ssim) if lambda_ssim > 0 else None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = pred - target
-        return self.charbonnier(diff) + self.gradient(diff) + self.laplacian(diff)
+        loss = self.charbonnier(diff) + self.gradient(diff) + self.laplacian(diff)
+        if self.fft is not None:
+            loss = loss + self.fft(pred, target)
+        if self.ssim is not None:
+            loss = loss + self.ssim(pred, target)
+        return loss
 
 
 class PSNRLoss(nn.Module):
@@ -81,13 +118,22 @@ class Stage2SharpLoss(nn.Module):
         eps: float = 1e-6,
         lambda_grad: float = 0.05,
         lambda_lap: float = 0.02,
+        lambda_fft: float = 0.0,
+        lambda_ssim: float = 0.0,
         channels: int = 3,
     ):
         super().__init__()
         self.psnr = PSNRLoss(data_range=data_range, eps=eps)
         self.gradient = SpatialGradientLoss(lambda_grad=lambda_grad, channels=channels)
         self.laplacian = LaplacianLoss(lambda_lap=lambda_lap, channels=channels)
+        self.fft = FFTLoss(lambda_fft=lambda_fft) if lambda_fft > 0 else None
+        self.ssim = SSIMLoss(lambda_ssim=lambda_ssim) if lambda_ssim > 0 else None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = pred - target
-        return self.psnr(pred, target) + self.gradient(diff) + self.laplacian(diff)
+        loss = self.psnr(pred, target) + self.gradient(diff) + self.laplacian(diff)
+        if self.fft is not None:
+            loss = loss + self.fft(pred, target)
+        if self.ssim is not None:
+            loss = loss + self.ssim(pred, target)
+        return loss

@@ -115,7 +115,7 @@ class DataGenWorker(QThread):
         num_crops: int = 3,
         p_blur: float = 0.5,
         blur_type: str = "random",
-        blur_range: Tuple[float, float] = (0.5, 2.5),
+        blur_range: Tuple[float, float] = (1.0, 4.0),
         max_workers: Optional[int] = None,
     ):
         super().__init__()
@@ -171,16 +171,29 @@ class TrainingWorker(QThread):
         try:
             import torch
             from torch.optim import AdamW
-            from torch.optim.lr_scheduler import CosineAnnealingLR
+            from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
             from torch.utils.data import DataLoader
             from devices import clear_device_cache, create_grad_scaler, get_amp_context, get_device, get_device_name
             from losses import Stage1Loss, PSNRLoss, Stage2SharpLoss
             from metrics import calculate_psnr, calculate_ssim
-            from train import get_progressive_patch_size
+            from train import ModelEMA, get_progressive_patch_size
+
+            if hasattr(torch, "set_float32_matmul_precision"):
+                try:
+                    torch.set_float32_matmul_precision("high")
+                except Exception:
+                    pass
 
             device = get_device(self.config.get("device", "auto"))
+            channels_last = (device.type in ("cuda", "xpu"))
             self.log_signal.emit(f"Initializing RepAF-Denoise Net on {device} ({get_device_name(device)})...")
             model = RepAFDenoiseNet(c=40).to(device)
+            if channels_last:
+                model = model.to(memory_format=torch.channels_last)
+
+            ema = ModelEMA(model, decay=0.999)
+            if channels_last:
+                ema.module.to(memory_format=torch.channels_last)
 
             num_workers = self.config.get("num_workers", 0)
             eval_interval = self.config.get("eval_interval", 5)
@@ -195,6 +208,8 @@ class TrainingWorker(QThread):
                 num_synthetic_samples=self.config.get("synthetic_samples", 64),
                 cache=not preload_ram,
                 preload_to_ram=preload_ram,
+                advanced_augment=True,
+                to_float=False,
             )
             val_dataset = DenoisingDataset(
                 noisy_dir=self.config.get("val_noisy_dir"),
@@ -204,15 +219,18 @@ class TrainingWorker(QThread):
                 num_synthetic_samples=32,
                 cache=not preload_ram,
                 preload_to_ram=preload_ram,
+                to_float=False,
             )
             val_loader = DataLoader(
                 val_dataset,
                 batch_size=16,
                 shuffle=False,
+                num_workers=0,
                 pin_memory=(device.type in ("cuda", "xpu")),
             )
 
             best_psnr = -float("inf")
+            best_ema_psnr = -float("inf")
             save_dir = "pytorch models"
             os.makedirs(save_dir, exist_ok=True)
             bf16 = self.config.get("bf16", False)
@@ -226,6 +244,7 @@ class TrainingWorker(QThread):
             if is_finetune and pretrained_path and os.path.exists(pretrained_path):
                 ckpt_info = load_pretrained_weights(model, pretrained_path, device=device)
                 best_psnr = ckpt_info.get("best_psnr", -float("inf"))
+                ema.module.load_state_dict(model.state_dict())
                 self.log_signal.emit(f"Loaded pre-trained weights from: {pretrained_path}")
 
             if self.config.get("freeze_stem", False):
@@ -233,23 +252,37 @@ class TrainingWorker(QThread):
                     p.requires_grad = False
                 self.log_signal.emit("Stem feature extractor frozen.")
 
+            def _eval_net(target_net):
+                target_net.eval()
+                t_psnr = torch.zeros(1, device=device)
+                t_ssim = torch.zeros(1, device=device)
+                cnt = 0
+                with torch.inference_mode():
+                    for n_b, c_b in val_loader:
+                        if self._is_stopped:
+                            return 0.0, 0.0
+                        if n_b.dtype == torch.uint8:
+                            t_dtype = amp_dtype if amp_enabled else torch.float32
+                            n_b = n_b.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
+                            c_b = c_b.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
+                        else:
+                            n_b = n_b.to(device, non_blocking=True)
+                            c_b = c_b.to(device, non_blocking=True)
+                        if channels_last:
+                            n_b = n_b.to(memory_format=torch.channels_last)
+                        with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
+                            pred = torch.clamp(target_net(n_b), 0.0, 1.0)
+                        if not torch.isfinite(pred).all():
+                            continue
+                        bs = n_b.size(0)
+                        t_psnr += calculate_psnr(pred, c_b, as_tensor=True) * bs
+                        t_ssim += calculate_ssim(pred, c_b, as_tensor=True) * bs
+                        cnt += bs
+                return (t_psnr / cnt).item() if cnt > 0 else 0.0, (t_ssim / cnt).item() if cnt > 0 else 0.0
+
             if is_finetune:
                 self.log_signal.emit("Evaluating baseline validation performance...")
-                model.eval()
-                total_psnr = torch.zeros(1, device=device)
-                total_ssim = torch.zeros(1, device=device)
-                count = 0
-                with torch.inference_mode():
-                    for noisy, clean in val_loader:
-                        noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                        with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
-                            pred = torch.clamp(model(noisy), 0.0, 1.0)
-                        bs = noisy.size(0)
-                        total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
-                        total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
-                        count += bs
-                base_psnr = (total_psnr / count).item() if count > 0 else 0.0
-                base_ssim = (total_ssim / count).item() if count > 0 else 0.0
+                base_psnr, base_ssim = _eval_net(model)
                 if base_psnr > best_psnr:
                     best_psnr = base_psnr
                 self.log_signal.emit(f"Pre-trained Baseline -> Val PSNR: {base_psnr:.2f} dB | SSIM: {base_ssim:.4f}")
@@ -258,7 +291,13 @@ class TrainingWorker(QThread):
                 s1_epochs = self.config["stage1_epochs"]
                 self.log_signal.emit(f"\n--- Starting Stage 1 ({s1_epochs} epochs) ---")
                 optimizer_s1 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
-                scheduler_s1 = CosineAnnealingLR(optimizer_s1, T_max=s1_epochs, eta_min=1e-6)
+                w1 = min(3, max(0, s1_epochs // 4))
+                if w1 > 0:
+                    s1_sch1 = LinearLR(optimizer_s1, start_factor=0.1, total_iters=w1)
+                    s1_sch2 = CosineAnnealingLR(optimizer_s1, T_max=s1_epochs - w1, eta_min=1e-6)
+                    scheduler_s1 = SequentialLR(optimizer_s1, schedulers=[s1_sch1, s1_sch2], milestones=[w1])
+                else:
+                    scheduler_s1 = CosineAnnealingLR(optimizer_s1, T_max=s1_epochs, eta_min=1e-6)
                 criterion_s1 = Stage1Loss(eps=1e-3, lambda_grad=0.05).to(device)
 
                 loader_s1 = DataLoader(
@@ -268,6 +307,7 @@ class TrainingWorker(QThread):
                     num_workers=num_workers,
                     pin_memory=(device.type in ("cuda", "xpu")),
                     persistent_workers=(num_workers > 0),
+                    prefetch_factor=2 if num_workers > 0 else None,
                     drop_last=(len(train_dataset) >= self.config["batch_size_stage1"]),
                 )
 
@@ -286,7 +326,15 @@ class TrainingWorker(QThread):
                     for noisy, clean in loader_s1:
                         if self._is_stopped:
                             break
-                        noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                        if noisy.dtype == torch.uint8:
+                            t_dtype = amp_dtype if amp_enabled else torch.float32
+                            noisy = noisy.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
+                            clean = clean.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
+                        else:
+                            noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                        if channels_last:
+                            noisy = noisy.to(memory_format=torch.channels_last)
+
                         optimizer_s1.zero_grad(set_to_none=True)
                         with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                             loss = criterion_s1(model(noisy), clean)
@@ -299,6 +347,7 @@ class TrainingWorker(QThread):
                             if torch.isfinite(grad_norm):
                                 scaler.step(optimizer_s1)
                                 scaler.update()
+                                ema.update(model)
                                 epoch_loss += loss.item() * noisy.size(0)
                                 valid_count += noisy.size(0)
                             else:
@@ -309,6 +358,7 @@ class TrainingWorker(QThread):
                             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                             if torch.isfinite(grad_norm):
                                 optimizer_s1.step()
+                                ema.update(model)
                                 epoch_loss += loss.item() * noisy.size(0)
                                 valid_count += noisy.size(0)
                             else:
@@ -324,27 +374,12 @@ class TrainingWorker(QThread):
 
                     should_eval = (epoch % eval_interval == 0) or (epoch == s1_epochs)
                     if should_eval:
-                        model.eval()
-                        total_psnr = torch.zeros(1, device=device)
-                        total_ssim = torch.zeros(1, device=device)
-                        count = 0
-                        with torch.inference_mode():
-                            for noisy, clean in val_loader:
-                                if self._is_stopped:
-                                    self.log_signal.emit("Training cancelled by user.")
-                                    self.finished.emit("Cancelled")
-                                    return
-                                noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                                with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
-                                    pred = torch.clamp(model(noisy), 0.0, 1.0)
-                                if not torch.isfinite(pred).all():
-                                    continue
-                                bs = noisy.size(0)
-                                total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
-                                total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
-                                count += bs
-                        val_psnr = (total_psnr / count).item() if count > 0 else 0.0
-                        val_ssim = (total_ssim / count).item() if count > 0 else 0.0
+                        val_psnr, val_ssim = _eval_net(model)
+                        ema_psnr, ema_ssim = _eval_net(ema.module)
+                        if self._is_stopped:
+                            self.log_signal.emit("Training cancelled by user.")
+                            self.finished.emit("Cancelled")
+                            return
 
                         is_best = val_psnr > best_psnr
                         if is_best:
@@ -353,7 +388,13 @@ class TrainingWorker(QThread):
                                 {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 1},
                                 os.path.join(save_dir, "best_model.pth"),
                             )
-                        val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
+                        if ema_psnr > best_ema_psnr:
+                            best_ema_psnr = ema_psnr
+                            torch.save(
+                                {"state_dict": ema.state_dict(), "best_psnr": best_ema_psnr, "stage": 1, "is_ema": True},
+                                os.path.join(save_dir, "best_model_ema.pth"),
+                            )
+                        val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f} | EMA: {ema_psnr:.2f} dB"
                     else:
                         val_str = "Val: (skipped)"
 
@@ -387,10 +428,17 @@ class TrainingWorker(QThread):
                 num_workers=num_workers,
                 pin_memory=(device.type in ("cuda", "xpu")),
                 persistent_workers=(num_workers > 0),
+                prefetch_factor=2 if num_workers > 0 else None,
                 drop_last=(len(train_dataset) >= self.config["batch_size_stage2"]),
             )
             optimizer_s2 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=s2_lr, betas=(0.9, 0.999), weight_decay=1e-4)
-            scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
+            w2 = min(2, max(0, s2_epochs // 4))
+            if w2 > 0:
+                s2_sch1 = LinearLR(optimizer_s2, start_factor=0.1, total_iters=w2)
+                s2_sch2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs - w2, eta_min=1e-6)
+                scheduler_s2 = SequentialLR(optimizer_s2, schedulers=[s2_sch1, s2_sch2], milestones=[w2])
+            else:
+                scheduler_s2 = CosineAnnealingLR(optimizer_s2, T_max=s2_epochs, eta_min=1e-6)
             criterion_s2 = Stage2SharpLoss(eps=1e-6).to(device)
 
             for epoch in range(1, s2_epochs + 1):
@@ -405,7 +453,15 @@ class TrainingWorker(QThread):
                 for noisy, clean in loader_s2:
                     if self._is_stopped:
                         break
-                    noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                    if noisy.dtype == torch.uint8:
+                        t_dtype = amp_dtype if amp_enabled else torch.float32
+                        noisy = noisy.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
+                        clean = clean.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
+                    else:
+                        noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                    if channels_last:
+                        noisy = noisy.to(memory_format=torch.channels_last)
+
                     optimizer_s2.zero_grad(set_to_none=True)
                     with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                         loss = criterion_s2(model(noisy), clean)
@@ -418,6 +474,7 @@ class TrainingWorker(QThread):
                         if torch.isfinite(grad_norm):
                             scaler.step(optimizer_s2)
                             scaler.update()
+                            ema.update(model)
                             epoch_loss += loss.item() * noisy.size(0)
                             valid_count += noisy.size(0)
                         else:
@@ -428,6 +485,7 @@ class TrainingWorker(QThread):
                         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         if torch.isfinite(grad_norm):
                             optimizer_s2.step()
+                            ema.update(model)
                             epoch_loss += loss.item() * noisy.size(0)
                             valid_count += noisy.size(0)
                         else:
@@ -443,27 +501,12 @@ class TrainingWorker(QThread):
 
                 should_eval = (epoch % eval_interval == 0) or (epoch == s2_epochs)
                 if should_eval:
-                    model.eval()
-                    total_psnr = torch.zeros(1, device=device)
-                    total_ssim = torch.zeros(1, device=device)
-                    count = 0
-                    with torch.inference_mode():
-                        for noisy, clean in val_loader:
-                            if self._is_stopped:
-                                self.log_signal.emit("Training cancelled by user.")
-                                self.finished.emit("Cancelled")
-                                return
-                            noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                            with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
-                                pred = torch.clamp(model(noisy), 0.0, 1.0)
-                            if not torch.isfinite(pred).all():
-                                continue
-                            bs = noisy.size(0)
-                            total_psnr += calculate_psnr(pred, clean, as_tensor=True) * bs
-                            total_ssim += calculate_ssim(pred, clean, as_tensor=True) * bs
-                            count += bs
-                    val_psnr = (total_psnr / count).item() if count > 0 else 0.0
-                    val_ssim = (total_ssim / count).item() if count > 0 else 0.0
+                    val_psnr, val_ssim = _eval_net(model)
+                    ema_psnr, ema_ssim = _eval_net(ema.module)
+                    if self._is_stopped:
+                        self.log_signal.emit("Training cancelled by user.")
+                        self.finished.emit("Cancelled")
+                        return
 
                     is_best = val_psnr > best_psnr
                     if is_best:
@@ -472,12 +515,13 @@ class TrainingWorker(QThread):
                             {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": 2 if not is_finetune else "finetune"},
                             os.path.join(save_dir, "best_model.pth"),
                         )
-                        if is_finetune:
-                            torch.save(
-                                {"state_dict": model.state_dict(), "best_psnr": best_psnr, "stage": "finetune"},
-                                os.path.join(save_dir, "finetuned_best.pth"),
-                            )
-                    val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f}"
+                    if ema_psnr > best_ema_psnr:
+                        best_ema_psnr = ema_psnr
+                        torch.save(
+                            {"state_dict": ema.state_dict(), "best_psnr": best_ema_psnr, "stage": 2 if not is_finetune else "finetune", "is_ema": True},
+                            os.path.join(save_dir, "best_model_ema.pth"),
+                        )
+                    val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f} | EMA: {ema_psnr:.2f} dB"
                 else:
                     val_str = "Val: (skipped)"
 
@@ -491,18 +535,17 @@ class TrainingWorker(QThread):
             # Export deployed models for immediate inference use
             try:
                 from export import _prepare_cpu_deploy_model, export_onnx
-                best_ckpt = os.path.join(save_dir, "best_model.pth")
-                if os.path.exists(best_ckpt):
-                    ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
-                    model.load_state_dict(ckpt["state_dict"])
-                deploy_model = _prepare_cpu_deploy_model(model)
+                deploy_source = ema.module if (best_ema_psnr >= best_psnr) else model
+                deploy_model = _prepare_cpu_deploy_model(deploy_source)
                 torch.save(deploy_model.state_dict(), os.path.join(save_dir, "repaf_denoise_net_deployed.pth"))
                 export_onnx(deploy_model, save_path="onnx models/repaf_denoise_net.onnx")
                 self.log_signal.emit("Auto-exported deployed PyTorch and ONNX models for inference.")
             except Exception as exp_err:
                 self.log_signal.emit(f"Note: Deployed export: {exp_err}")
 
-            self.log_signal.emit(f"\nTraining Complete! Best PSNR: {best_psnr:.2f} dB")
+            final_best = max(best_psnr, best_ema_psnr)
+            self.log_signal.emit(f"\nTraining Complete! Best PSNR: {final_best:.2f} dB")
+            self.finished.emit("Success")
             self.finished.emit("Success")
         except Exception as e:
             self.log_signal.emit(f"Error: {e}")
@@ -619,7 +662,7 @@ class RepAFDenoiseGUI(QMainWindow):
         self.slider_blur.setValue(0)
         self.lbl_blur_val = QLabel("Blur Radius: 0.0")
         self.slider_blur.valueChanged.connect(
-            lambda v: self.lbl_blur_val.setText(f"Blur Radius: {v / 10.0:.1f}")
+            lambda v: self.lbl_blur_val.setText(f"Blur Radius: {v * 4.0 / 50.0:.1f}")
         )
 
         self.btn_inject_noise = QPushButton("Inject Degradation to Image")
@@ -772,7 +815,7 @@ class RepAFDenoiseGUI(QMainWindow):
 
         self.spin_workers = QSpinBox()
         self.spin_workers.setRange(0, 16)
-        self.spin_workers.setValue(2)
+        self.spin_workers.setValue(min(8, max(2, (os.cpu_count() or 4) // 2)))
 
         self.spin_eval_interval = QSpinBox()
         self.spin_eval_interval.setRange(1, 100)
@@ -903,11 +946,11 @@ class RepAFDenoiseGUI(QMainWindow):
 
         self.spin_blur_min = QDoubleSpinBox()
         self.spin_blur_min.setRange(0.1, 10.0)
-        self.spin_blur_min.setValue(0.5)
+        self.spin_blur_min.setValue(1.0)
 
         self.spin_blur_max = QDoubleSpinBox()
         self.spin_blur_max.setRange(0.1, 10.0)
-        self.spin_blur_max.setValue(2.5)
+        self.spin_blur_max.setValue(4.0)
 
         blur_layout = QHBoxLayout()
         blur_layout.addWidget(self.chk_blur)
@@ -923,6 +966,9 @@ class RepAFDenoiseGUI(QMainWindow):
         blur_layout.addWidget(QLabel("to"))
         blur_layout.addWidget(self.spin_blur_max)
         blur_layout.addStretch()
+
+        self.chk_blur.toggled.connect(self._on_blur_toggled)
+        self._on_blur_toggled(self.chk_blur.isChecked())
 
         self.spin_datagen_workers = QSpinBox()
         self.spin_datagen_workers.setRange(1, 16)
@@ -956,6 +1002,12 @@ class RepAFDenoiseGUI(QMainWindow):
         self.spin_random_versions.setEnabled(checked)
         self.spin_q_min.setEnabled(checked)
         self.spin_q_max.setEnabled(checked)
+
+    def _on_blur_toggled(self, checked: bool):
+        self.spin_p_blur.setEnabled(checked)
+        self.combo_blur_type.setEnabled(checked)
+        self.spin_blur_min.setEnabled(checked)
+        self.spin_blur_max.setEnabled(checked)
 
     # -------------------------------------------------------------------------
     # UI Logic & Event Handlers
@@ -1038,12 +1090,12 @@ class RepAFDenoiseGUI(QMainWindow):
             return
 
         q = self.slider_quality.value()
-        blur_val = self.slider_blur.value() / 10.0
+        blur_val = (self.slider_blur.value() / 50.0) * 4.0
         degraded = apply_downsample_upsample(self.loaded_image, scale=0.85)
         if blur_val > 0.0:
             degraded = apply_blur(degraded, blur_type="gaussian", strength=blur_val)
-        degraded = apply_jpeg_compression(degraded, quality=q)
         degraded = add_gaussian_noise(degraded, sigma=0.02)
+        degraded = apply_jpeg_compression(degraded, quality=q)
 
         self.noisy_image = degraded
         w, h = self.noisy_image.size
@@ -1262,6 +1314,10 @@ class RepAFDenoiseGUI(QMainWindow):
         p_blur = self.spin_p_blur.value() if self.chk_blur.isChecked() else 0.0
         blur_type = self.combo_blur_type.currentText()
         blur_range = (self.spin_blur_min.value(), self.spin_blur_max.value())
+        if self.chk_blur.isChecked() and p_blur > 0.0:
+            self.datagen_log.append(
+                f"Blurring active: type={blur_type}, prob={p_blur:.2f}, range=[{blur_range[0]:.1f}, {blur_range[1]:.1f}]"
+            )
 
         self.datagen_worker = DataGenWorker(
             samples_dir="samples",
