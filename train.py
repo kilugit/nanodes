@@ -2,7 +2,7 @@ import argparse
 import copy
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -10,7 +10,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
-from dataset import DenoisingDataset
+from dataset import CUDAPrefetcher, DenoisingDataset
 from devices import clear_device_cache, create_grad_scaler, get_amp_context, get_device as resolve_device, get_device_name
 from export import export_int8_quantization, export_onnx
 from losses import PSNRLoss, Stage1Loss, Stage2SharpLoss
@@ -24,17 +24,23 @@ class ModelEMA:
         for p in self.module.parameters():
             p.requires_grad = False
         self.decay = decay
+        self.ema_params = [p.data for p in self.module.parameters()]
 
     @torch.no_grad()
     def update(self, model: nn.Module):
-        for ep, mp in zip(self.module.parameters(), model.parameters()):
-            ep.data.lerp_(mp.data, 1.0 - self.decay)
+        model_params = [p.data for p in model.parameters()]
+        if hasattr(torch, "_foreach_lerp_"):
+            torch._foreach_lerp_(self.ema_params, model_params, 1.0 - self.decay)
+        else:
+            for ep, mp in zip(self.ema_params, model_params):
+                ep.lerp_(mp, 1.0 - self.decay)
 
     def state_dict(self):
         return self.module.state_dict()
 
     def load_state_dict(self, state_dict):
         self.module.load_state_dict(state_dict)
+        self.ema_params = [p.data for p in self.module.parameters()]
 
 
 def get_device(hint: str = "auto") -> torch.device:
@@ -51,7 +57,7 @@ def get_progressive_patch_size(epoch: int, total_epochs: int, min_size: int = 12
 
 def train_one_epoch(
     model: nn.Module,
-    loader: DataLoader,
+    loader: Union[DataLoader, CUDAPrefetcher],
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -63,7 +69,7 @@ def train_one_epoch(
     channels_last: bool = False,
 ) -> float:
     model.train()
-    running_loss = 0.0
+    running_loss = torch.zeros((), device=device)
     valid_count = 0
     is_xla = (device.type == "xla")
     amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32)
@@ -81,35 +87,32 @@ def train_one_epoch(
     optimizer.zero_grad(set_to_none=True)
 
     for step, (noisy, clean) in enumerate(device_loader):
-        if not is_xla or noisy.device != device:
+        if not is_xla and noisy.device != device:
             if noisy.dtype == torch.uint8:
                 target_dtype = amp_dtype if amp_enabled else torch.float32
-                noisy = noisy.to(device, dtype=target_dtype, non_blocking=True).div_(255.0)
-                clean = clean.to(device, dtype=target_dtype, non_blocking=True).div_(255.0)
+                noisy = noisy.to(device, dtype=target_dtype, non_blocking=True).mul_(1.0 / 255.0)
+                clean = clean.to(device, dtype=target_dtype, non_blocking=True).mul_(1.0 / 255.0)
             else:
                 noisy = noisy.to(device, non_blocking=True)
                 clean = clean.to(device, non_blocking=True)
-        if channels_last:
-            noisy = noisy.to(memory_format=torch.channels_last)
+            if channels_last:
+                noisy = noisy.to(memory_format=torch.channels_last)
 
         with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
             pred = model(noisy)
             loss = criterion(pred, clean)
 
-        if not torch.isfinite(loss) or loss.abs().item() > 100.0:
+        if not torch.isfinite(loss):
             continue
 
-        raw_loss = loss.item()
-        if accum_steps > 1:
-            loss = loss / accum_steps
-
+        loss_step = loss / accum_steps if accum_steps > 1 else loss
         is_update_step = ((step + 1) % accum_steps == 0) or ((step + 1) == total_steps)
 
         if scaler is not None and scaler.is_enabled():
-            scaler.scale(loss).backward()
+            scaler.scale(loss_step).backward()
             if is_update_step:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
                 if torch.isfinite(grad_norm):
                     scaler.step(optimizer)
                     scaler.update()
@@ -119,9 +122,9 @@ def train_one_epoch(
                     scaler.update()
                 optimizer.zero_grad(set_to_none=True)
         else:
-            loss.backward()
+            loss_step.backward()
             if is_update_step:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
                 if torch.isfinite(grad_norm):
                     if is_xla:
                         import torch_xla.core.xla_model as xm
@@ -132,16 +135,16 @@ def train_one_epoch(
                         ema.update(model)
                 optimizer.zero_grad(set_to_none=True)
 
-        running_loss += raw_loss * noisy.size(0)
+        running_loss += loss.detach() * noisy.size(0)
         valid_count += noisy.size(0)
 
-    return running_loss / valid_count if valid_count > 0 else float("nan")
+    return (running_loss / valid_count).item() if valid_count > 0 else float("nan")
 
 
 @torch.inference_mode()
 def evaluate(
     model: nn.Module,
-    loader: DataLoader,
+    loader: Union[DataLoader, CUDAPrefetcher],
     device: torch.device,
     bf16: bool = False,
     fp16: bool = False,
@@ -164,16 +167,16 @@ def evaluate(
             eval_loader = loader
 
     for noisy, clean in eval_loader:
-        if not is_xla or noisy.device != device:
+        if not is_xla and noisy.device != device:
             if noisy.dtype == torch.uint8:
                 target_dtype = amp_dtype if amp_enabled else torch.float32
-                noisy = noisy.to(device, dtype=target_dtype, non_blocking=True).div_(255.0)
-                clean = clean.to(device, dtype=target_dtype, non_blocking=True).div_(255.0)
+                noisy = noisy.to(device, dtype=target_dtype, non_blocking=True).mul_(1.0 / 255.0)
+                clean = clean.to(device, dtype=target_dtype, non_blocking=True).mul_(1.0 / 255.0)
             else:
                 noisy = noisy.to(device, non_blocking=True)
                 clean = clean.to(device, non_blocking=True)
-        if channels_last:
-            noisy = noisy.to(memory_format=torch.channels_last)
+            if channels_last:
+                noisy = noisy.to(memory_format=torch.channels_last)
 
         with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
             pred = torch.clamp(model(noisy), 0.0, 1.0)
@@ -238,7 +241,7 @@ def run_pipeline(args):
 
     num_workers = args.num_workers
     if num_workers == 0 and not args.dry_run and os.cpu_count():
-        num_workers = min(8, max(2, os.cpu_count() // 2))
+        num_workers = min(4, max(1, os.cpu_count() // 2))
 
     channels_last = getattr(args, "channels_last", True) and (device.type in ("cuda", "xpu"))
     dev_name = get_device_name(device)
@@ -290,6 +293,8 @@ def run_pipeline(args):
         num_workers=0,
         pin_memory=(device.type in ("cuda", "xpu")),
     )
+    amp_dtype = torch.float16 if args.fp16 else (torch.bfloat16 if args.bf16 else torch.float32)
+    val_iter = CUDAPrefetcher(val_loader, device=device, dtype=amp_dtype, channels_last=channels_last) if device.type == "cuda" else val_loader
 
     best_psnr = -float("inf")
     best_ema_psnr = -float("inf")
@@ -326,15 +331,16 @@ def run_pipeline(args):
             return SequentialLR(opt, schedulers=[s1, s2], milestones=[w])
         return CosineAnnealingLR(opt, T_max=epochs, eta_min=1e-6)
 
+    fused_opt = (device.type in ("cuda", "xpu"))
     if args.finetune:
-        base_psnr, base_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
+        base_psnr, base_ssim = evaluate(model, val_iter, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
         print(f"\nPre-trained Baseline -> Val PSNR: {base_psnr:.2f} dB | Val SSIM: {base_ssim:.4f}")
         if base_psnr > best_psnr:
             best_psnr = base_psnr
     else:
         # Stage 1: Coarse Training with Progressive Patch Sizes
         print(f"\nStage 1: {args.stage1_epochs} epochs | Batch Size: {args.batch_size_stage1} | Workers: {num_workers}")
-        optimizer_s1 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
+        optimizer_s1 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4, fused=fused_opt)
         scheduler_s1 = build_scheduler(optimizer_s1, args.stage1_epochs, warmup=args.warmup_epochs)
         criterion_s1 = Stage1Loss(eps=1e-3, lambda_grad=0.05, lambda_fft=args.lambda_fft, lambda_ssim=args.lambda_ssim).to(device)
 
@@ -348,14 +354,15 @@ def run_pipeline(args):
             prefetch_factor=2 if num_workers > 0 else None,
             drop_last=(len(train_dataset) >= args.batch_size_stage1),
         )
+        train_iter_s1 = CUDAPrefetcher(train_loader_s1, device=device, dtype=amp_dtype, channels_last=channels_last) if device.type == "cuda" else train_loader_s1
 
         for epoch in range(1, args.stage1_epochs + 1):
             t0 = time.time()
-            patch_size = args.patch_size or get_progressive_patch_size(epoch - 1, args.stage1_epochs, min_size=128, max_size=256)
+            patch_size = args.patch_size or (128 if args.stage1_epochs > 1 else 256)
             train_dataset.set_patch_size(patch_size)
 
             loss = train_one_epoch(
-                model, train_loader_s1, criterion_s1, optimizer_s1, device,
+                model, train_iter_s1, criterion_s1, optimizer_s1, device,
                 bf16=args.bf16, fp16=args.fp16, scaler=scaler,
                 ema=ema, accum_steps=args.accum_steps, channels_last=channels_last
             )
@@ -363,14 +370,14 @@ def run_pipeline(args):
 
             should_eval = (epoch % args.eval_interval == 0) or (epoch == args.stage1_epochs)
             if should_eval:
-                val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
+                val_psnr, val_ssim = evaluate(model, val_iter, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
                 is_best = val_psnr > best_psnr
                 if is_best:
                     best_psnr = val_psnr
                 val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f} {'*BEST*' if is_best else ''}"
 
                 if ema is not None:
-                    ema_psnr, ema_ssim = evaluate(ema.module, val_loader, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
+                    ema_psnr, ema_ssim = evaluate(ema.module, val_iter, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
                     is_ema_best = ema_psnr > best_ema_psnr
                     if is_ema_best:
                         best_ema_psnr = ema_psnr
@@ -433,15 +440,16 @@ def run_pipeline(args):
         prefetch_factor=2 if num_workers > 0 else None,
         drop_last=(len(train_dataset) >= args.batch_size_stage2),
     )
+    train_iter_s2 = CUDAPrefetcher(train_loader_s2, device=device, dtype=amp_dtype, channels_last=channels_last) if device.type == "cuda" else train_loader_s2
 
-    optimizer_s2 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=s2_lr, betas=(0.9, 0.999), weight_decay=1e-4)
+    optimizer_s2 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=s2_lr, betas=(0.9, 0.999), weight_decay=1e-4, fused=fused_opt)
     scheduler_s2 = build_scheduler(optimizer_s2, s2_epochs, warmup=max(1, args.warmup_epochs // 2))
     criterion_s2 = Stage2SharpLoss(data_range=1.0, eps=1e-6, lambda_fft=args.lambda_fft, lambda_ssim=args.lambda_ssim).to(device)
 
     for epoch in range(1, s2_epochs + 1):
         t0 = time.time()
         loss = train_one_epoch(
-            model, train_loader_s2, criterion_s2, optimizer_s2, device,
+            model, train_iter_s2, criterion_s2, optimizer_s2, device,
             bf16=args.bf16, fp16=args.fp16, scaler=scaler,
             ema=ema, accum_steps=args.accum_steps, channels_last=channels_last
         )
@@ -449,14 +457,14 @@ def run_pipeline(args):
 
         should_eval = (epoch % args.eval_interval == 0) or (epoch == s2_epochs)
         if should_eval:
-            val_psnr, val_ssim = evaluate(model, val_loader, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
+            val_psnr, val_ssim = evaluate(model, val_iter, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
             is_best = val_psnr > best_psnr
             if is_best:
                 best_psnr = val_psnr
             val_str = f"Val PSNR: {val_psnr:.2f} dB | SSIM: {val_ssim:.4f} {'*BEST*' if is_best else ''}"
 
             if ema is not None:
-                ema_psnr, ema_ssim = evaluate(ema.module, val_loader, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
+                ema_psnr, ema_ssim = evaluate(ema.module, val_iter, device, bf16=args.bf16, fp16=args.fp16, channels_last=channels_last)
                 is_ema_best = ema_psnr > best_ema_psnr
                 if is_ema_best:
                     best_ema_psnr = ema_psnr

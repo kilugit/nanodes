@@ -181,7 +181,7 @@ class DenoisingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.use_synthetic:
-            base_size = max(512, self.patch_size)
+            base_size = (self.patch_size + 8) if self.patch_size else 256
             clean = torch.rand(3, base_size, base_size, dtype=torch.float32)
             noise_std = random.uniform(0.02, 0.10)
             noisy = clean
@@ -228,3 +228,59 @@ class DenoisingDataset(Dataset):
         if self.to_float:
             return noisy.float().div_(255.0), clean.float().div_(255.0)
         return noisy, clean
+
+
+class CUDAPrefetcher:
+    """Overlaps host-to-device memory transfer and normalization on a CUDA stream."""
+
+    def __init__(self, loader, device: torch.device, dtype: torch.dtype = torch.float32, channels_last: bool = False):
+        self.loader = loader
+        self.device = device
+        self.dtype = dtype
+        self.channels_last = channels_last
+        self.stream = torch.cuda.Stream(device=device) if device.type == "cuda" else None
+
+    def __len__(self) -> int:
+        return len(self.loader)
+
+    def __iter__(self):
+        self.it = iter(self.loader)
+        self.preload()
+        return self
+
+    def preload(self):
+        try:
+            self.next_noisy, self.next_clean = next(self.it)
+        except StopIteration:
+            self.next_noisy = None
+            self.next_clean = None
+            return
+
+        if self.stream is not None:
+            with torch.cuda.stream(self.stream):
+                self.next_noisy = self.next_noisy.to(self.device, non_blocking=True)
+                self.next_clean = self.next_clean.to(self.device, non_blocking=True)
+                if self.next_noisy.dtype == torch.uint8:
+                    self.next_noisy = self.next_noisy.to(dtype=self.dtype).mul_(1.0 / 255.0)
+                    self.next_clean = self.next_clean.to(dtype=self.dtype).mul_(1.0 / 255.0)
+                if self.channels_last:
+                    self.next_noisy = self.next_noisy.to(memory_format=torch.channels_last)
+        else:
+            if self.next_noisy.dtype == torch.uint8:
+                self.next_noisy = self.next_noisy.to(self.device, dtype=self.dtype).mul_(1.0 / 255.0)
+                self.next_clean = self.next_clean.to(self.device, dtype=self.dtype).mul_(1.0 / 255.0)
+            else:
+                self.next_noisy = self.next_noisy.to(self.device)
+                self.next_clean = self.next_clean.to(self.device)
+            if self.channels_last:
+                self.next_noisy = self.next_noisy.to(memory_format=torch.channels_last)
+
+    def __next__(self):
+        if self.next_noisy is None:
+            raise StopIteration
+        if self.stream is not None:
+            torch.cuda.current_stream().wait_stream(self.stream)
+        noisy, clean = self.next_noisy, self.next_clean
+        self.preload()
+        return noisy, clean
+

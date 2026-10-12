@@ -50,6 +50,35 @@ class LaplacianLoss(nn.Module):
         return self.lambda_lap * curv.abs().mean()
 
 
+class FusedSpatialLoss(nn.Module):
+    def __init__(self, lambda_grad: float = 0.05, lambda_lap: float = 0.02, channels: int = 3):
+        super().__init__()
+        self.lambda_grad = lambda_grad * 2.0
+        self.lambda_lap = lambda_lap
+        self.channels = channels
+        self.enabled = (lambda_grad > 0 or lambda_lap > 0)
+
+        sx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3)
+        sy = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=torch.float32).view(1, 1, 3, 3)
+        lap = torch.tensor([[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]], dtype=torch.float32).view(1, 1, 3, 3)
+        fused = torch.cat([torch.stack([sx, sy, lap], dim=1).view(3, 1, 3, 3)] * channels, dim=0)
+        self.register_buffer("fused_filter", fused)
+
+    def forward(self, diff: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return torch.zeros(1, device=diff.device, dtype=diff.dtype).sum()
+        filter_k = self.fused_filter.to(dtype=diff.dtype)
+        gc = F.conv2d(diff, filter_k, padding=1, groups=self.channels)
+        b, _, h, w = gc.shape
+        gc_r = gc.view(b, self.channels, 3, h, w)
+        loss = 0.0
+        if self.lambda_grad > 0:
+            loss = loss + self.lambda_grad * gc_r[:, :, :2].abs().mean()
+        if self.lambda_lap > 0:
+            loss = loss + self.lambda_lap * gc_r[:, :, 2].abs().mean()
+        return loss
+
+
 class FFTLoss(nn.Module):
     def __init__(self, lambda_fft: float = 0.05):
         super().__init__()
@@ -84,14 +113,13 @@ class Stage1Loss(nn.Module):
     ):
         super().__init__()
         self.charbonnier = CharbonnierLoss(eps=eps)
-        self.gradient = SpatialGradientLoss(lambda_grad=lambda_grad, channels=channels)
-        self.laplacian = LaplacianLoss(lambda_lap=lambda_lap, channels=channels)
+        self.spatial = FusedSpatialLoss(lambda_grad=lambda_grad, lambda_lap=lambda_lap, channels=channels)
         self.fft = FFTLoss(lambda_fft=lambda_fft) if lambda_fft > 0 else None
         self.ssim = SSIMLoss(lambda_ssim=lambda_ssim) if lambda_ssim > 0 else None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = pred - target
-        loss = self.charbonnier(diff) + self.gradient(diff) + self.laplacian(diff)
+        loss = self.charbonnier(diff) + self.spatial(diff)
         if self.fft is not None:
             loss = loss + self.fft(pred, target)
         if self.ssim is not None:
@@ -105,8 +133,8 @@ class PSNRLoss(nn.Module):
         self.scale = data_range**2
         self.eps = eps
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        diff = pred - target
+    def forward(self, pred: torch.Tensor, target: Optional[torch.Tensor] = None) -> torch.Tensor:
+        diff = pred - target if target is not None else pred
         mse = torch.mean(diff.square())
         return -10.0 * torch.log10(self.scale / (mse + self.eps))
 
@@ -124,14 +152,13 @@ class Stage2SharpLoss(nn.Module):
     ):
         super().__init__()
         self.psnr = PSNRLoss(data_range=data_range, eps=eps)
-        self.gradient = SpatialGradientLoss(lambda_grad=lambda_grad, channels=channels)
-        self.laplacian = LaplacianLoss(lambda_lap=lambda_lap, channels=channels)
+        self.spatial = FusedSpatialLoss(lambda_grad=lambda_grad, lambda_lap=lambda_lap, channels=channels)
         self.fft = FFTLoss(lambda_fft=lambda_fft) if lambda_fft > 0 else None
         self.ssim = SSIMLoss(lambda_ssim=lambda_ssim) if lambda_ssim > 0 else None
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         diff = pred - target
-        loss = self.psnr(pred, target) + self.gradient(diff) + self.laplacian(diff)
+        loss = self.psnr(diff) + self.spatial(diff)
         if self.fft is not None:
             loss = loss + self.fft(pred, target)
         if self.ssim is not None:

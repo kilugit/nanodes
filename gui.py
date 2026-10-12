@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from dataset import DenoisingDataset, set_max_cache_items
+from dataset import CUDAPrefetcher, DenoisingDataset, set_max_cache_items
 from inference import run_denoise
 from models import RepAFDenoiseNet, load_pretrained_weights
 from process_samples import (
@@ -228,6 +228,8 @@ class TrainingWorker(QThread):
                 num_workers=0,
                 pin_memory=(device.type in ("cuda", "xpu")),
             )
+            amp_dtype = torch.float16 if self.config.get("fp16", False) else (torch.bfloat16 if self.config.get("bf16", False) else torch.float32)
+            val_iter = CUDAPrefetcher(val_loader, device=device, dtype=amp_dtype, channels_last=channels_last) if device.type == "cuda" else val_loader
 
             best_psnr = -float("inf")
             best_ema_psnr = -float("inf")
@@ -235,7 +237,6 @@ class TrainingWorker(QThread):
             os.makedirs(save_dir, exist_ok=True)
             bf16 = self.config.get("bf16", False)
             fp16 = self.config.get("fp16", False)
-            amp_dtype = torch.float16 if fp16 else (torch.bfloat16 if bf16 else torch.float32)
             amp_enabled = (fp16 or bf16) and device.type in ("cuda", "xpu", "cpu")
             scaler = create_grad_scaler(device, enabled=(fp16 and device.type in ("cuda", "xpu")))
 
@@ -258,18 +259,19 @@ class TrainingWorker(QThread):
                 t_ssim = torch.zeros(1, device=device)
                 cnt = 0
                 with torch.inference_mode():
-                    for n_b, c_b in val_loader:
+                    for n_b, c_b in val_iter:
                         if self._is_stopped:
                             return 0.0, 0.0
-                        if n_b.dtype == torch.uint8:
-                            t_dtype = amp_dtype if amp_enabled else torch.float32
-                            n_b = n_b.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
-                            c_b = c_b.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
-                        else:
-                            n_b = n_b.to(device, non_blocking=True)
-                            c_b = c_b.to(device, non_blocking=True)
-                        if channels_last:
-                            n_b = n_b.to(memory_format=torch.channels_last)
+                        if n_b.device != device:
+                            if n_b.dtype == torch.uint8:
+                                t_dtype = amp_dtype if amp_enabled else torch.float32
+                                n_b = n_b.to(device, dtype=t_dtype, non_blocking=True).mul_(1.0 / 255.0)
+                                c_b = c_b.to(device, dtype=t_dtype, non_blocking=True).mul_(1.0 / 255.0)
+                            else:
+                                n_b = n_b.to(device, non_blocking=True)
+                                c_b = c_b.to(device, non_blocking=True)
+                            if channels_last:
+                                n_b = n_b.to(memory_format=torch.channels_last)
                         with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                             pred = torch.clamp(target_net(n_b), 0.0, 1.0)
                         if not torch.isfinite(pred).all():
@@ -290,7 +292,8 @@ class TrainingWorker(QThread):
                 # Stage 1
                 s1_epochs = self.config["stage1_epochs"]
                 self.log_signal.emit(f"\n--- Starting Stage 1 ({s1_epochs} epochs) ---")
-                optimizer_s1 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4)
+                fused_opt = (device.type in ("cuda", "xpu"))
+                optimizer_s1 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=2e-4, betas=(0.9, 0.999), weight_decay=1e-4, fused=fused_opt)
                 w1 = min(3, max(0, s1_epochs // 4))
                 if w1 > 0:
                     s1_sch1 = LinearLR(optimizer_s1, start_factor=0.1, total_iters=w1)
@@ -310,6 +313,7 @@ class TrainingWorker(QThread):
                     prefetch_factor=2 if num_workers > 0 else None,
                     drop_last=(len(train_dataset) >= self.config["batch_size_stage1"]),
                 )
+                loader_iter_s1 = CUDAPrefetcher(loader_s1, device=device, dtype=amp_dtype, channels_last=channels_last) if device.type == "cuda" else loader_s1
 
                 for epoch in range(1, s1_epochs + 1):
                     if self._is_stopped:
@@ -321,45 +325,46 @@ class TrainingWorker(QThread):
                     train_dataset.set_patch_size(patch_size)
 
                     model.train()
-                    epoch_loss = 0.0
+                    epoch_loss = torch.zeros((), device=device)
                     valid_count = 0
-                    for noisy, clean in loader_s1:
+                    for noisy, clean in loader_iter_s1:
                         if self._is_stopped:
                             break
-                        if noisy.dtype == torch.uint8:
-                            t_dtype = amp_dtype if amp_enabled else torch.float32
-                            noisy = noisy.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
-                            clean = clean.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
-                        else:
-                            noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                        if channels_last:
-                            noisy = noisy.to(memory_format=torch.channels_last)
+                        if noisy.device != device:
+                            if noisy.dtype == torch.uint8:
+                                t_dtype = amp_dtype if amp_enabled else torch.float32
+                                noisy = noisy.to(device, dtype=t_dtype, non_blocking=True).mul_(1.0 / 255.0)
+                                clean = clean.to(device, dtype=t_dtype, non_blocking=True).mul_(1.0 / 255.0)
+                            else:
+                                noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                            if channels_last:
+                                noisy = noisy.to(memory_format=torch.channels_last)
 
                         optimizer_s1.zero_grad(set_to_none=True)
                         with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                             loss = criterion_s1(model(noisy), clean)
-                        if not torch.isfinite(loss) or loss.abs().item() > 100.0:
+                        if not torch.isfinite(loss):
                             continue
                         if scaler.is_enabled():
                             scaler.scale(loss).backward()
                             scaler.unscale_(optimizer_s1)
-                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
                             if torch.isfinite(grad_norm):
                                 scaler.step(optimizer_s1)
                                 scaler.update()
                                 ema.update(model)
-                                epoch_loss += loss.item() * noisy.size(0)
+                                epoch_loss += loss.detach() * noisy.size(0)
                                 valid_count += noisy.size(0)
                             else:
                                 optimizer_s1.zero_grad(set_to_none=True)
                                 scaler.update()
                         else:
                             loss.backward()
-                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
                             if torch.isfinite(grad_norm):
                                 optimizer_s1.step()
                                 ema.update(model)
-                                epoch_loss += loss.item() * noisy.size(0)
+                                epoch_loss += loss.detach() * noisy.size(0)
                                 valid_count += noisy.size(0)
                             else:
                                 optimizer_s1.zero_grad(set_to_none=True)
@@ -370,7 +375,7 @@ class TrainingWorker(QThread):
                         return
 
                     scheduler_s1.step()
-                    mean_loss = epoch_loss / valid_count if valid_count > 0 else float("nan")
+                    mean_loss = (epoch_loss / valid_count).item() if valid_count > 0 else float("nan")
 
                     should_eval = (epoch % eval_interval == 0) or (epoch == s1_epochs)
                     if should_eval:
@@ -431,7 +436,8 @@ class TrainingWorker(QThread):
                 prefetch_factor=2 if num_workers > 0 else None,
                 drop_last=(len(train_dataset) >= self.config["batch_size_stage2"]),
             )
-            optimizer_s2 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=s2_lr, betas=(0.9, 0.999), weight_decay=1e-4)
+            loader_iter_s2 = CUDAPrefetcher(loader_s2, device=device, dtype=amp_dtype, channels_last=channels_last) if device.type == "cuda" else loader_s2
+            optimizer_s2 = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=s2_lr, betas=(0.9, 0.999), weight_decay=1e-4, fused=fused_opt)
             w2 = min(2, max(0, s2_epochs // 4))
             if w2 > 0:
                 s2_sch1 = LinearLR(optimizer_s2, start_factor=0.1, total_iters=w2)
@@ -448,45 +454,46 @@ class TrainingWorker(QThread):
                     return
 
                 model.train()
-                epoch_loss = 0.0
+                epoch_loss = torch.zeros((), device=device)
                 valid_count = 0
-                for noisy, clean in loader_s2:
+                for noisy, clean in loader_iter_s2:
                     if self._is_stopped:
                         break
-                    if noisy.dtype == torch.uint8:
-                        t_dtype = amp_dtype if amp_enabled else torch.float32
-                        noisy = noisy.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
-                        clean = clean.to(device, dtype=t_dtype, non_blocking=True).div_(255.0)
-                    else:
-                        noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
-                    if channels_last:
-                        noisy = noisy.to(memory_format=torch.channels_last)
+                    if noisy.device != device:
+                        if noisy.dtype == torch.uint8:
+                            t_dtype = amp_dtype if amp_enabled else torch.float32
+                            noisy = noisy.to(device, dtype=t_dtype, non_blocking=True).mul_(1.0 / 255.0)
+                            clean = clean.to(device, dtype=t_dtype, non_blocking=True).mul_(1.0 / 255.0)
+                        else:
+                            noisy, clean = noisy.to(device, non_blocking=True), clean.to(device, non_blocking=True)
+                        if channels_last:
+                            noisy = noisy.to(memory_format=torch.channels_last)
 
                     optimizer_s2.zero_grad(set_to_none=True)
                     with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                         loss = criterion_s2(model(noisy), clean)
-                    if not torch.isfinite(loss) or loss.abs().item() > 100.0:
+                    if not torch.isfinite(loss):
                         continue
                     if scaler.is_enabled():
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer_s2)
-                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
                         if torch.isfinite(grad_norm):
                             scaler.step(optimizer_s2)
                             scaler.update()
                             ema.update(model)
-                            epoch_loss += loss.item() * noisy.size(0)
+                            epoch_loss += loss.detach() * noisy.size(0)
                             valid_count += noisy.size(0)
                         else:
                             optimizer_s2.zero_grad(set_to_none=True)
                             scaler.update()
                     else:
                         loss.backward()
-                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
                         if torch.isfinite(grad_norm):
                             optimizer_s2.step()
                             ema.update(model)
-                            epoch_loss += loss.item() * noisy.size(0)
+                            epoch_loss += loss.detach() * noisy.size(0)
                             valid_count += noisy.size(0)
                         else:
                             optimizer_s2.zero_grad(set_to_none=True)
@@ -497,7 +504,7 @@ class TrainingWorker(QThread):
                     return
 
                 scheduler_s2.step()
-                mean_loss = epoch_loss / valid_count if valid_count > 0 else float("nan")
+                mean_loss = (epoch_loss / valid_count).item() if valid_count > 0 else float("nan")
 
                 should_eval = (epoch % eval_interval == 0) or (epoch == s2_epochs)
                 if should_eval:

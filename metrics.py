@@ -47,18 +47,18 @@ def calculate_ssim(
     as_tensor: bool = False,
 ):
     channels = img1.size(1)
-    window = _get_gaussian_window(window_size, sigma, channels, img1.device, img1.dtype)
-
-    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channels)
-    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channels)
+    window = _get_gaussian_window(window_size, sigma, channels * 5, img1.device, img1.dtype)
+    stacked = torch.cat([img1, img2, img1 * img1, img2 * img2, img1 * img2], dim=1)
+    moments = F.conv2d(stacked, window, padding=window_size // 2, groups=channels * 5)
+    mu1, mu2, s1_conv, s2_conv, s12_conv = moments.chunk(5, dim=1)
 
     mu1_sq = mu1 * mu1
     mu2_sq = mu2 * mu2
     mu1_mu2 = mu1 * mu2
 
-    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size // 2, groups=channels) - mu1_sq
-    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size // 2, groups=channels) - mu2_sq
-    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=channels) - mu1_mu2
+    sigma1_sq = s1_conv - mu1_sq
+    sigma2_sq = s2_conv - mu2_sq
+    sigma12 = s12_conv - mu1_mu2
 
     c1 = (0.01 * data_range) ** 2
     c2 = (0.03 * data_range) ** 2
