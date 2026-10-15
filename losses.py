@@ -67,8 +67,9 @@ class FusedSpatialLoss(nn.Module):
     def forward(self, diff: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             return torch.zeros(1, device=diff.device, dtype=diff.dtype).sum()
-        filter_k = self.fused_filter.to(dtype=diff.dtype)
-        gc = F.conv2d(diff, filter_k, padding=1, groups=self.channels)
+        if self.fused_filter.dtype != diff.dtype:
+            self.fused_filter = self.fused_filter.to(dtype=diff.dtype)
+        gc = F.conv2d(diff, self.fused_filter, padding=1, groups=self.channels)
         b, _, h, w = gc.shape
         gc_r = gc.view(b, self.channels, 3, h, w)
         loss = 0.0

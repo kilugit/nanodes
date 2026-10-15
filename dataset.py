@@ -64,8 +64,8 @@ def paired_crop(
         top = (h - patch_size) // 2
         left = (w - patch_size) // 2
 
-    noisy_patch = noisy[:, top : top + patch_size, left : left + patch_size]
-    clean_patch = clean[:, top : top + patch_size, left : left + patch_size]
+    noisy_patch = noisy[:, top : top + patch_size, left : left + patch_size].contiguous()
+    clean_patch = clean[:, top : top + patch_size, left : left + patch_size].contiguous()
     return noisy_patch, clean_patch
 
 
@@ -159,10 +159,12 @@ class DenoisingDataset(Dataset):
                         n_arr = np.array(n_img.convert("RGB"))
                     with Image.open(cp) as c_img:
                         c_arr = np.array(c_img.convert("RGB"))
-                    return (
-                        torch.from_numpy(n_arr).permute(2, 0, 1),
-                        torch.from_numpy(c_arr).permute(2, 0, 1),
-                    )
+                    tn = torch.from_numpy(n_arr).permute(2, 0, 1).contiguous()
+                    tc = torch.from_numpy(c_arr).permute(2, 0, 1).contiguous()
+                    if torch.cuda.is_available():
+                        tn = tn.pin_memory()
+                        tc = tc.pin_memory()
+                    return (tn, tc)
                 except Exception:
                     return None
 

@@ -198,6 +198,8 @@ class TrainingWorker(QThread):
             num_workers = self.config.get("num_workers", 0)
             eval_interval = self.config.get("eval_interval", 5)
             preload_ram = self.config.get("preload_ram", False)
+            if preload_ram:
+                num_workers = 0
             set_max_cache_items(self.config.get("max_cache_items", 2048))
 
             train_dataset = DenoisingDataset(
@@ -343,31 +345,24 @@ class TrainingWorker(QThread):
                         optimizer_s1.zero_grad(set_to_none=True)
                         with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                             loss = criterion_s1(model(noisy), clean)
-                        if not torch.isfinite(loss):
-                            continue
                         if scaler.is_enabled():
                             scaler.scale(loss).backward()
                             scaler.unscale_(optimizer_s1)
-                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
-                            if torch.isfinite(grad_norm):
-                                scaler.step(optimizer_s1)
-                                scaler.update()
-                                ema.update(model)
-                                epoch_loss += loss.detach() * noisy.size(0)
-                                valid_count += noisy.size(0)
-                            else:
-                                optimizer_s1.zero_grad(set_to_none=True)
-                                scaler.update()
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
+                            scaler.step(optimizer_s1)
+                            scaler.update()
+                            ema.update(model)
+                            epoch_loss += loss.detach() * noisy.size(0)
+                            valid_count += noisy.size(0)
+                            optimizer_s1.zero_grad(set_to_none=True)
                         else:
                             loss.backward()
-                            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
-                            if torch.isfinite(grad_norm):
-                                optimizer_s1.step()
-                                ema.update(model)
-                                epoch_loss += loss.detach() * noisy.size(0)
-                                valid_count += noisy.size(0)
-                            else:
-                                optimizer_s1.zero_grad(set_to_none=True)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
+                            optimizer_s1.step()
+                            ema.update(model)
+                            epoch_loss += loss.detach() * noisy.size(0)
+                            valid_count += noisy.size(0)
+                            optimizer_s1.zero_grad(set_to_none=True)
 
                     if self._is_stopped:
                         self.log_signal.emit("Training cancelled by user.")
@@ -472,30 +467,23 @@ class TrainingWorker(QThread):
                     optimizer_s2.zero_grad(set_to_none=True)
                     with get_amp_context(device, enabled=amp_enabled, dtype=amp_dtype):
                         loss = criterion_s2(model(noisy), clean)
-                    if not torch.isfinite(loss):
-                        continue
-                    if scaler.is_enabled():
-                        scaler.scale(loss).backward()
-                        scaler.unscale_(optimizer_s2)
-                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
-                        if torch.isfinite(grad_norm):
+                        if scaler.is_enabled():
+                            scaler.scale(loss).backward()
+                            scaler.unscale_(optimizer_s2)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
                             scaler.step(optimizer_s2)
                             scaler.update()
                             ema.update(model)
                             epoch_loss += loss.detach() * noisy.size(0)
                             valid_count += noisy.size(0)
-                        else:
                             optimizer_s2.zero_grad(set_to_none=True)
-                            scaler.update()
-                    else:
-                        loss.backward()
-                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
-                        if torch.isfinite(grad_norm):
+                        else:
+                            loss.backward()
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
                             optimizer_s2.step()
                             ema.update(model)
                             epoch_loss += loss.detach() * noisy.size(0)
                             valid_count += noisy.size(0)
-                        else:
                             optimizer_s2.zero_grad(set_to_none=True)
 
                 if self._is_stopped:

@@ -102,9 +102,6 @@ def train_one_epoch(
             pred = model(noisy)
             loss = criterion(pred, clean)
 
-        if not torch.isfinite(loss):
-            continue
-
         loss_step = loss / accum_steps if accum_steps > 1 else loss
         is_update_step = ((step + 1) % accum_steps == 0) or ((step + 1) == total_steps)
 
@@ -112,27 +109,23 @@ def train_one_epoch(
             scaler.scale(loss_step).backward()
             if is_update_step:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
-                if torch.isfinite(grad_norm):
-                    scaler.step(optimizer)
-                    scaler.update()
-                    if ema is not None:
-                        ema.update(model)
-                else:
-                    scaler.update()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
+                scaler.step(optimizer)
+                scaler.update()
+                if ema is not None:
+                    ema.update(model)
                 optimizer.zero_grad(set_to_none=True)
         else:
             loss_step.backward()
             if is_update_step:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
-                if torch.isfinite(grad_norm):
-                    if is_xla:
-                        import torch_xla.core.xla_model as xm
-                        xm.optimizer_step(optimizer)
-                    else:
-                        optimizer.step()
-                    if ema is not None:
-                        ema.update(model)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, foreach=True)
+                if is_xla:
+                    import torch_xla.core.xla_model as xm
+                    xm.optimizer_step(optimizer)
+                else:
+                    optimizer.step()
+                if ema is not None:
+                    ema.update(model)
                 optimizer.zero_grad(set_to_none=True)
 
         running_loss += loss.detach() * noisy.size(0)
@@ -234,13 +227,11 @@ def run_pipeline(args):
         torch.backends.cudnn.benchmark = True
 
     if not args.fp16 and not args.bf16:
-        if device.type in ("cuda", "xpu") and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
-            args.bf16 = True
-        elif device.type in ("cuda", "xpu"):
+        if device.type in ("cuda", "xpu"):
             args.fp16 = True
 
     num_workers = args.num_workers
-    if num_workers == 0 and not args.dry_run and os.cpu_count():
+    if num_workers == 0 and not args.dry_run and not args.preload_ram and os.cpu_count():
         num_workers = min(4, max(1, os.cpu_count() // 2))
 
     channels_last = getattr(args, "channels_last", True) and (device.type in ("cuda", "xpu"))

@@ -29,13 +29,16 @@ def calculate_psnr(
 ):
     diff = img1 - img2
     mse = torch.mean(diff.square())
+    if as_tensor:
+        val = 10.0 * torch.log10((data_range**2) / torch.clamp(mse, min=1e-10))
+        return torch.nan_to_num(val, nan=0.0, posinf=100.0)
     if not torch.isfinite(mse) or mse < 0:
         val = torch.tensor(0.0, device=img1.device)
     elif mse == 0:
         val = torch.tensor(float("inf"), device=img1.device)
     else:
         val = 10.0 * torch.log10((data_range**2) / mse)
-    return val if as_tensor else val.item()
+    return val.item()
 
 
 def calculate_ssim(
